@@ -1,0 +1,4 @@
+pywin32>=306
+pystray>=0.19
+Pillow>=10.0
+PySide6>=6.6
