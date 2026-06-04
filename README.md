@@ -57,7 +57,9 @@ Changes apply immediately on save — no restart needed.
 
 ## Building from Source
 
-**Requirements:** Python 3.8+, and [Inno Setup 6](https://jrsoftware.org/isdl.php) (for the installer stage).
+> This section is **only for developers** who want to build the app themselves. If you just want to use it, download the installer from [Releases](https://github.com/CodyAdams0744/Windows-Focus-Manager/releases) — no Python needed.
+
+**To build, you'll need:** Python 3.8+, and [Inno Setup 6](https://jrsoftware.org/isdl.php) (for the installer stage).
 
 ```bash
 pip install -r requirements.txt
