@@ -29,3 +29,6 @@ config.json
 
 # Claude Code local settings
 .claude/
+
+# Design handoff files (prototype reference) — kept local, not for the repo
+handoff/

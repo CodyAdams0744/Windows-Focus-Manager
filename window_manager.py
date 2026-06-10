@@ -65,6 +65,10 @@ _work_area_cache: Dict[int, Rect] = {}
 # Per-hwnd monitor handle cache — windows rarely jump between monitors.
 _monitor_cache: Dict[int, int] = {}
 
+# Sentinel _focused value meaning "this monitor is in the return-to-center
+# even-tiled state" (no real window focused).  Never a valid hwnd.
+_EVEN = -1
+
 
 class _CRECT(ctypes.Structure):
     _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
@@ -131,11 +135,13 @@ _auto_excluded_exes: Set[str] = set()
 class WindowManager:
     def __init__(self) -> None:
         self.states: Dict[int, WindowState] = {}
-        self._focused: Dict[int, Optional[int]] = {}   # monitor → expanded hwnd
+        self._focused: Dict[int, Optional[int]] = {}   # monitor → expanded hwnd (or _EVEN)
         self._last_poll: float = 0.0
         self._paused: bool = False
         # Hover mode: per-monitor pending candidate and the time the cursor first landed on it.
         self._hover_candidate: Dict[int, Tuple[Optional[int], float]] = {}
+        # Return-to-center: monitor → frozenset of hwnds last evened (for re-even on change).
+        self._even_set: Dict[int, frozenset] = {}
 
     # ------------------------------------------------------------------
     # Pause / Resume (called from the system-tray menu)
@@ -151,6 +157,7 @@ class WindowManager:
         # Clear focus state so resume starts fresh.
         self._focused.clear()
         self._hover_candidate.clear()
+        self._even_set.clear()
 
     def resume(self) -> None:
         """Re-enable tiling."""
@@ -286,6 +293,11 @@ class WindowManager:
         monitors: Set[int] = set(hwnd_to_mon.values())
         monitors.discard(0)
 
+        # Return-to-center: only active in hover mode.  When enabled, every
+        # monitor without a focused window tiles evenly (handled separately so
+        # the default code path below is unchanged).
+        rtc = config.HOVER_ENABLED and config.RETURN_TO_CENTER
+
         for mon in monitors:
             if not _is_monitor_enabled(mon):
                 continue
@@ -295,6 +307,11 @@ class WindowManager:
                 continue
 
             old_focus = self._focused.get(mon)
+
+            if rtc:
+                self._rtc_monitor(mon, mon_wins, old_focus, active_mon,
+                                  hover_hwnd, now)
+                continue
 
             if mon != active_mon:
                 # Housekeeping for non-active monitors only.
@@ -353,6 +370,53 @@ class WindowManager:
                 for hwnd, tgt in _restore_targets(mon_wins).items():
                     if hwnd in self.states:
                         _begin_animation(self.states[hwnd], tgt, now)
+
+    # ------------------------------------------------------------------
+    # Return-to-center: a monitor with no focused window tiles evenly
+    # ------------------------------------------------------------------
+
+    def _rtc_monitor(self, mon: int, mon_wins: Dict[int, WindowState],
+                     old_focus, active_mon: int, hover_hwnd: int,
+                     now: float) -> None:
+        win_set = frozenset(mon_wins)
+
+        # Only the monitor under the cursor can hold a hover-focused window.
+        if mon == active_mon and config.HOVER_ENABLED:
+            new_focus = _resolve_hover(
+                mon, hover_hwnd, mon_wins, self._hover_candidate, now, old_focus)
+        else:
+            new_focus = None
+        # A focus that points at a gone window (or the sentinel) is "no focus".
+        if new_focus is not None and new_focus not in self.states:
+            new_focus = None
+
+        desired = _EVEN if new_focus is None else new_focus
+        # Re-even if the window set changed while already evened.
+        need_reeven = (desired == _EVEN and old_focus == _EVEN
+                       and self._even_set.get(mon) != win_set)
+        if desired == old_focus and not need_reeven:
+            return
+
+        _adopt_manual_resizes(mon_wins)
+        self._focused[mon] = desired
+        mwa = _monitor_work_area(mon)
+
+        if desired == _EVEN:
+            self._even_set[mon] = win_set
+            targets = _layout_even(mon_wins, mwa)
+        else:
+            self._even_set.pop(mon, None)
+            targets = _layout_focus_targets(desired, mon_wins, mwa)
+
+        # Gap-free: pre-snap to the current tiled state, then animate to target.
+        tiled_now = _compute_current_tiled(mon_wins, mwa)
+        for hwnd, snap in tiled_now.items():
+            if hwnd in self.states:
+                _apply_rect(hwnd, snap, verify=False)
+        for hwnd, tgt in targets.items():
+            if hwnd in self.states:
+                _begin_animation(self.states[hwnd], tgt, now,
+                                 start_rect=tiled_now.get(hwnd))
 
     # ------------------------------------------------------------------
     # Animation step — ~60 fps
@@ -562,6 +626,51 @@ def _layout_focus_targets(
                 log.debug("  tile[%d] hwnd=%-8d  y=%-5d  h=%-5d  shadow=%d  %r",
                           i, h, y, hh, shadow, _safe_title(h))
             y = y + hh   # next tile's logical top (not y=b — avoids accumulating shadow)
+        return targets
+
+
+def _layout_even(
+    mon_wins: Dict[int, WindowState],
+    mwa: Rect,
+) -> Dict[int, Rect]:
+    """Even, gap-free split — every window gets an equal share of the monitor.
+
+    Ordering and edge/shadow handling mirror _layout_focus_targets so the
+    return-to-center layout is visually consistent with focus tiling.
+    """
+    mw = mwa[2] - mwa[0]
+    mh = mwa[3] - mwa[1]
+    n = len(mon_wins)
+    if n == 0:
+        return {}
+
+    if mw >= mh:   # ── Landscape — equal widths ─────────────────────────
+        ordered = sorted(
+            mon_wins.items(),
+            key=lambda kv: (kv[1].original_rect[0] + kv[1].original_rect[2]) // 2,
+        )
+        each = mw // n
+        targets: Dict[int, Rect] = {}
+        x = mwa[0]
+        for i, (h, _) in enumerate(ordered):
+            r = mwa[2] if i == n - 1 else x + each
+            targets[h] = (x, mwa[1], r, mwa[3])
+            x = r
+        return targets
+
+    else:           # ── Portrait — equal heights ─────────────────────────
+        ordered = sorted(
+            mon_wins.items(),
+            key=lambda kv: (kv[1].original_rect[1] + kv[1].original_rect[3]) // 2,
+        )
+        each = mh // n
+        targets: Dict[int, Rect] = {}
+        y = mwa[1]
+        for i, (h, _) in enumerate(ordered):
+            shadow = _cached_shadow_insets(h)[3]
+            b = mwa[3] + shadow if i == n - 1 else y + each + shadow
+            targets[h] = (mwa[0], y, mwa[2], b)
+            y = y + each
         return targets
 
 

@@ -11,7 +11,7 @@
 ; Download Inno Setup 6 from: https://jrsoftware.org/isdl.php
 
 #define AppName     "Windows Focus Manager"
-#define AppVersion  "1.1.0"
+#define AppVersion  "1.2.0"
 #define AppExe      "WindowFocusManager.exe"
 ; Unique GUID that identifies this app in the Windows registry.
 ; Never change this value — doing so breaks upgrade detection.

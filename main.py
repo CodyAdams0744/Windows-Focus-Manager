@@ -94,40 +94,8 @@ def _watch_config(log: logging.Logger) -> None:
 
 
 # ---------------------------------------------------------------------------
-# System-tray icon
+# Settings window launcher
 # ---------------------------------------------------------------------------
-
-def _make_tray_icon():
-    """Create a dark 4-tile grid tray icon matching the UI header mark."""
-    try:
-        from PIL import Image, ImageDraw
-    except ImportError:
-        return None
-
-    size  = 64
-    img   = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    d     = ImageDraw.Draw(img)
-
-    d.rounded_rectangle([2, 2, size - 3, size - 3], radius=14,
-                        fill=(28, 28, 28, 255))
-
-    inset = 10
-    gap   = 4
-    tile  = (size - inset * 2 - gap) // 2
-    r     = 4
-
-    tl = (inset,          inset,          inset + tile,          inset + tile)
-    tr = (inset+tile+gap, inset,          inset+tile+gap+tile,   inset + tile)
-    bl = (inset,          inset+tile+gap, inset + tile,          inset+tile+gap+tile)
-    br = (inset+tile+gap, inset+tile+gap, inset+tile+gap+tile,   inset+tile+gap+tile)
-
-    d.rounded_rectangle(tl, radius=r, fill=(255, 255, 255, 220))
-    d.rounded_rectangle(tr, radius=r, fill=(255, 255, 255, 128))
-    d.rounded_rectangle(bl, radius=r, fill=(255, 255, 255, 128))
-    d.rounded_rectangle(br, radius=r, fill=(255, 255, 255,  60))
-
-    return img
-
 
 def _launch_settings_window(log: logging.Logger) -> None:
     """Open the native settings window as a separate process.
@@ -147,51 +115,6 @@ def _launch_settings_window(log: logging.Logger) -> None:
         subprocess.Popen(args, close_fds=True)
     except Exception as exc:
         log.error("Could not open settings window: %s", exc)
-
-
-def _run_tray(manager, log: logging.Logger) -> None:
-    """Start the system-tray icon (call in a daemon thread)."""
-    try:
-        import pystray
-    except ImportError:
-        log.warning("pystray not installed — system tray unavailable.")
-        return
-
-    icon_img = _make_tray_icon()
-    if icon_img is None:
-        log.warning("Pillow not installed — system tray unavailable.")
-        return
-
-    def on_pause_resume(icon, _item):
-        if manager._paused:
-            manager.resume()
-        else:
-            manager.pause()
-        icon.menu = _build_menu()
-        icon.update_menu()
-
-    def on_open_settings(_icon, _item):
-        _launch_settings_window(log)
-
-    def on_exit(icon, _item):
-        log.info("Exit requested from tray.")
-        manager.pause()
-        icon.stop()
-        os._exit(0)
-
-    def _build_menu():
-        label = "Resume" if manager._paused else "Pause"
-        return pystray.Menu(
-            pystray.MenuItem(label, on_pause_resume),
-            pystray.MenuItem("Open Settings", on_open_settings),
-            pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Exit", on_exit),
-        )
-
-    icon = pystray.Icon(
-        "WindowFocusManager", icon_img, "Window Focus Manager", menu=_build_menu())
-    log.info("System tray icon started.")
-    icon.run()
 
 
 # ---------------------------------------------------------------------------
@@ -274,14 +197,16 @@ def main() -> None:
                                daemon=True, name="config-watcher")
     watcher.start()
 
-    tray = threading.Thread(target=_run_tray, args=(manager, log),
-                            daemon=True, name="tray")
-    tray.start()
+    # The tiler runs on a background thread so the Qt tray can own the main
+    # thread (QSystemTrayIcon + the bento flyout need the Qt event loop).
+    tiler = threading.Thread(target=manager.run, daemon=True, name="tiler")
+    tiler.start()
 
     # Open the settings window on launch.
     _launch_settings_window(log)
 
-    manager.run()
+    import tray
+    tray.run_tray(manager, log)
 
 
 def _run_settings() -> None:

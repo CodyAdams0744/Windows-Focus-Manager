@@ -132,6 +132,7 @@ def _build_exe(icon_path: Path | None) -> Path:
         # the lazy `import settings_window` in main.py, but name it explicitly too.
         "--hidden-import", "settings_window",
         "--hidden-import", "config_io",
+        "--hidden-import", "tray",
 
         # pywin32 hidden imports that PyInstaller misses
         "--hidden-import", "win32timezone",

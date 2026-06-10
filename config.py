@@ -17,6 +17,7 @@ DEFAULTS: dict = {
     "min_window_height":     200,
     "hover_enabled":         False,  # True = expand on hover; False = expand on click/focus
     "hover_delay_ms":        300,    # ms the cursor must rest before hover triggers
+    "return_to_center":      False,  # hover mode: monitors with no focus tile evenly
     "skip_classes": [
         "Shell_TrayWnd", "Progman", "WorkerW", "DV2ControlHost",
         "MsgrIMEWindowClass", "SysShadow", "tooltips_class32",
@@ -64,5 +65,6 @@ SKIP_EXE              : tuple     = tuple(s.lower() for s in _cfg.get("skip_exe"
 LOG_LEVEL             : str       = str(_cfg["log_level"])
 HOVER_ENABLED         : bool      = bool(_cfg.get("hover_enabled", False))
 HOVER_DELAY_MS        : int       = int(_cfg.get("hover_delay_ms", 300))
+RETURN_TO_CENTER      : bool      = bool(_cfg.get("return_to_center", False))
 # None = all monitors; list of {"left": x, "top": y} = only those monitors
 ENABLED_MONITORS                  = _cfg.get("enabled_monitors") or None

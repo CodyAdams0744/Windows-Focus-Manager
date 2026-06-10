@@ -25,7 +25,7 @@ A lightweight tiling window manager for Windows that automatically expands your 
 
 ## Installation
 
-1. Download **`WindowFocusManager_Setup.exe`** from the [Releases](https://github.com/CodyAdams0744/windows-focus-manager/releases) page.
+1. Download **`WindowFocusManager_Setup.exe`** from the [Releases](https://github.com/CodyAdams0744/Windows-Focus-Manager/releases) page.
 2. Run it. Windows Focus Manager installs per-user (no admin prompt) and starts in your system tray.
 
 > [!NOTE]
@@ -51,9 +51,9 @@ Open Settings from the tray icon to configure:
 
 Changes apply immediately on save — no restart needed.
 
-| Settings | Monitors |
-|:---:|:---:|
-| ![Settings window](docs/settings.png) | ![Per-monitor selection](docs/monitors.png) |
+<p align="center">
+  <img src="docs/WFMNewUi.png" alt="Windows Focus Manager settings dashboard" width="920">
+</p>
 
 ## Building from Source
 
