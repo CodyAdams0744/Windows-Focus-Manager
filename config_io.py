@@ -10,6 +10,7 @@ watcher in main.py, so saving here applies settings with no restart.
 """
 
 import json
+import os
 import sys
 import winreg
 from pathlib import Path
@@ -48,12 +49,17 @@ def load_config() -> dict:
 
 
 def save_config(data: dict) -> None:
-    """Write config.json.  skip_classes is preserved from the existing file
-    if the caller didn't supply it (the UI never edits the built-in class list)."""
+    """Write config.json atomically (temp file + os.replace) so a crash
+    mid-write can't corrupt it and readers never see a partial file.
+
+    skip_classes is preserved from the existing file if the caller didn't
+    supply it (the UI never edits the built-in class list)."""
     existing = load_config()
     if "skip_classes" not in data:
         data["skip_classes"] = existing.get("skip_classes", DEFAULTS["skip_classes"])
-    CONFIG_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    tmp = CONFIG_FILE.with_name(CONFIG_FILE.name + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    os.replace(tmp, CONFIG_FILE)
 
 
 # ---------------------------------------------------------------------------
@@ -116,8 +122,15 @@ def get_monitors() -> list:
             flags = info.get("Flags", 0)
             mw    = mr[2] - mr[0]
             mh    = mr[3] - mr[1]
+            # Windows' "Display N" number comes from the device name
+            # (e.g. \\.\DISPLAY2 -> 2), not the enumeration order.
+            device = info.get("Device", "")
+            digits = "".join(ch for ch in device if ch.isdigit())
+            number = int(digits) if digits else i + 1
             monitors.append({
                 "index":       i,
+                "number":      number,
+                "device":      device,
                 "handle":      int(hmon),
                 "left":        mr[0],
                 "top":         mr[1],

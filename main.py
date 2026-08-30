@@ -1,7 +1,6 @@
 # main.py — entry point for Windows Focus Manager
 
 import ctypes
-import importlib
 import logging
 import logging.handlers
 import os
@@ -46,7 +45,9 @@ def _watch_config(log: logging.Logger) -> None:
         handle = win32file.FindFirstChangeNotification(
             str(_CONFIG_JSON.parent),
             False,          # do not watch subdirectories
-            0x00000010,     # FILE_NOTIFY_CHANGE_LAST_WRITE
+            # LAST_WRITE | FILE_NAME — FILE_NAME is needed because the settings
+            # UI saves atomically via os.replace (a rename, not a write).
+            0x00000010 | 0x00000001,
         )
         _event_driven = True
     except Exception as exc:
@@ -80,7 +81,9 @@ def _watch_config(log: logging.Logger) -> None:
         mtime = new_mtime
         time.sleep(0.15)   # let the write fully flush before reading
         try:
-            importlib.reload(_cfg_mod)
+            # In-place attribute update — avoids importlib.reload re-executing
+            # the module while the tiler thread is reading it.
+            _cfg_mod.reload()
             logging.getLogger().setLevel(
                 getattr(logging, _cfg_mod.LOG_LEVEL, logging.INFO))
             log.info("Config reloaded — new settings applied (no restart needed).")
@@ -120,6 +123,16 @@ def _launch_settings_window(log: logging.Logger) -> None:
 # ---------------------------------------------------------------------------
 # Startup helpers
 # ---------------------------------------------------------------------------
+
+def _is_first_run() -> bool:
+    """True until the user finishes the welcome screen (welcome_seen saved)."""
+    try:
+        import json
+        return not json.loads(
+            _CONFIG_JSON.read_text(encoding="utf-8")).get("welcome_seen", False)
+    except Exception:
+        return True
+
 
 def _set_dpi_awareness() -> None:
     try:
@@ -202,8 +215,10 @@ def main() -> None:
     tiler = threading.Thread(target=manager.run, daemon=True, name="tiler")
     tiler.start()
 
-    # Open the settings window on launch.
-    _launch_settings_window(log)
+    # Open the settings window on first run only — on subsequent launches
+    # (including autostart at login) the app starts quietly in the tray.
+    if _is_first_run():
+        _launch_settings_window(log)
 
     import tray
     tray.run_tray(manager, log)

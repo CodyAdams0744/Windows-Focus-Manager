@@ -31,6 +31,7 @@ Behaviour
 import ctypes
 import logging
 import os
+import threading
 import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Tuple
@@ -51,6 +52,8 @@ _CONSOLE_HWND: int = int(ctypes.windll.kernel32.GetConsoleWindow())
 
 # DWM attribute: visible frame bounds (excludes the invisible shadow border).
 _DWMWA_EXTENDED_FRAME_BOUNDS = 9
+# DWM attribute: non-zero → window is cloaked (other virtual desktop, etc.).
+_DWMWA_CLOAKED = 14
 
 # Shadow insets don't change during a window's lifetime.
 # Cached here and cleared when the hwnd leaves self.states.
@@ -60,8 +63,10 @@ _shadow_cache: Dict[int, Tuple[int, int, int, int]] = {}
 _pid_exe_cache: Dict[int, str] = {}
 # Per-hwnd class name cache — class names never change for a given hwnd.
 _class_cache: Dict[int, str] = {}
-# Per-hmonitor work area cache — display topology rarely changes.
-_work_area_cache: Dict[int, Rect] = {}
+# Per-hmonitor work area cache, entries expire after a short TTL so
+# resolution / taskbar / docking changes are picked up without a restart.
+_work_area_cache: Dict[int, Tuple[Rect, float]] = {}
+_WORK_AREA_TTL_S = 5.0
 # Per-hwnd monitor handle cache — windows rarely jump between monitors.
 _monitor_cache: Dict[int, int] = {}
 
@@ -142,22 +147,30 @@ class WindowManager:
         self._hover_candidate: Dict[int, Tuple[Optional[int], float]] = {}
         # Return-to-center: monitor → frozenset of hwnds last evened (for re-even on change).
         self._even_set: Dict[int, frozenset] = {}
+        # Guards self.states and the layout state.  The tiler thread holds it
+        # for each poll/animation step; the tray thread (pause/resume/exit)
+        # holds it while restoring — prevents mutation during iteration.
+        self._lock = threading.RLock()
 
     # ------------------------------------------------------------------
     # Pause / Resume (called from the system-tray menu)
     # ------------------------------------------------------------------
 
     def pause(self) -> None:
-        """Stop tiling and restore all windows to their original positions."""
+        """Stop tiling and restore all windows to their original positions.
+
+        Called from the tray (Qt) thread — the lock waits for the tiler
+        thread to finish its current frame before windows are restored."""
         if self._paused:
             return
-        self._paused = True
-        log.info("Window Focus Manager paused — restoring all windows.")
-        self._restore_all()
-        # Clear focus state so resume starts fresh.
-        self._focused.clear()
-        self._hover_candidate.clear()
-        self._even_set.clear()
+        with self._lock:
+            self._paused = True
+            log.info("Window Focus Manager paused — restoring all windows.")
+            self._restore_all()
+            # Clear focus state so resume starts fresh.
+            self._focused.clear()
+            self._hover_candidate.clear()
+            self._even_set.clear()
 
     def resume(self) -> None:
         """Re-enable tiling."""
@@ -182,18 +195,20 @@ class WindowManager:
             while True:
                 frame_start = time.monotonic()
 
-                if frame_start - self._last_poll >= config.POLL_INTERVAL_MS / 1000.0:
-                    self._poll(frame_start)
-                    self._last_poll = frame_start
+                with self._lock:
+                    if frame_start - self._last_poll >= config.POLL_INTERVAL_MS / 1000.0:
+                        self._poll(frame_start)
+                        self._last_poll = frame_start
 
-                self._step_animations(frame_start)
+                    self._step_animations(frame_start)
 
                 elapsed_ms = (time.monotonic() - frame_start) * 1000.0
                 time.sleep(max(0.0, config.ANIM_FRAME_MS - elapsed_ms) / 1000.0)
 
         except KeyboardInterrupt:
             log.info("Shutting down — restoring all windows.")
-            self._restore_all()
+            with self._lock:
+                self._restore_all()
         finally:
             _winmm.timeEndPeriod(1)
 
@@ -354,13 +369,13 @@ class WindowManager:
                 # Both the snap (start) and the focus target (end) are tiled,
                 # so during animation every adjacent pair shares the same
                 # interpolated boundary — the desktop never peeks through.
-                tiled_now = _compute_current_tiled(mon_wins, mwa)
+                tiled_now = _compute_current_tiled(mon_wins, mwa, mon)
                 for hwnd, snap in tiled_now.items():
                     if hwnd in self.states:
                         _apply_rect(hwnd, snap, verify=False)
 
                 # ── Step 2: animate to focus-based tiled target ────────
-                targets = _layout_focus_targets(new_focus, mon_wins, mwa)
+                targets = _layout_focus_targets(new_focus, mon_wins, mwa, mon)
                 for hwnd, tgt in targets.items():
                     if hwnd in self.states:
                         _begin_animation(self.states[hwnd], tgt, now,
@@ -403,13 +418,13 @@ class WindowManager:
 
         if desired == _EVEN:
             self._even_set[mon] = win_set
-            targets = _layout_even(mon_wins, mwa)
+            targets = _layout_even(mon_wins, mwa, mon)
         else:
             self._even_set.pop(mon, None)
-            targets = _layout_focus_targets(desired, mon_wins, mwa)
+            targets = _layout_focus_targets(desired, mon_wins, mwa, mon)
 
         # Gap-free: pre-snap to the current tiled state, then animate to target.
-        tiled_now = _compute_current_tiled(mon_wins, mwa)
+        tiled_now = _compute_current_tiled(mon_wins, mwa, mon)
         for hwnd, snap in tiled_now.items():
             if hwnd in self.states:
                 _apply_rect(hwnd, snap, verify=False)
@@ -417,6 +432,59 @@ class WindowManager:
             if hwnd in self.states:
                 _begin_animation(self.states[hwnd], tgt, now,
                                  start_rect=tiled_now.get(hwnd))
+
+    # ------------------------------------------------------------------
+    # Manual placement — swap which window occupies which tile
+    # ------------------------------------------------------------------
+
+    def _mon_windows(self, mon: int) -> Dict[int, WindowState]:
+        return {h: s for h, s in self.states.items() if _get_monitor(h) == mon}
+
+    def _targets_for(self, mon: int, mon_wins: Dict[int, WindowState],
+                     mwa: Rect) -> Dict[int, Rect]:
+        """The resting layout for a monitor at its current focus state."""
+        focus = self._focused.get(mon)
+        if focus is None or focus == _EVEN or focus not in self.states:
+            return _layout_even(mon_wins, mwa, mon)
+        return _layout_focus_targets(focus, mon_wins, mwa, mon)
+
+    def _animate_to(self, mon: int, mon_wins: Dict[int, WindowState],
+                    targets: Dict[int, Rect], mwa: Rect, now: float) -> None:
+        """Gap-free pre-snap, then animate every window to its target rect."""
+        tiled_now = _compute_current_tiled(mon_wins, mwa, mon)
+        for hwnd, snap in tiled_now.items():
+            if hwnd in self.states:
+                _apply_rect(hwnd, snap, verify=False)
+        for hwnd, tgt in targets.items():
+            if hwnd in self.states:
+                _begin_animation(self.states[hwnd], tgt, now,
+                                 start_rect=tiled_now.get(hwnd))
+
+    def current_zones(self, mon: int) -> Dict[int, Rect]:
+        """Return {hwnd: rect} for the monitor's resting layout — the drop
+        zones a drag can target.  Thread-safe (callable from the Qt thread)."""
+        with self._lock:
+            mon_wins = self._mon_windows(mon)
+            if not mon_wins:
+                return {}
+            return self._targets_for(mon, mon_wins, _monitor_work_area(mon))
+
+    def swap_windows(self, mon: int, hwnd_a: int, hwnd_b: int) -> None:
+        """Swap which tile two windows occupy (by swapping their layout anchors)
+        and retile the monitor.  Thread-safe; called by the drag controller."""
+        if hwnd_a == hwnd_b:
+            return
+        with self._lock:
+            if hwnd_a not in self.states or hwnd_b not in self.states:
+                return
+            sa, sb = self.states[hwnd_a], self.states[hwnd_b]
+            sa.original_rect, sb.original_rect = sb.original_rect, sa.original_rect
+            mon_wins = self._mon_windows(mon)
+            if not mon_wins:
+                return
+            mwa = _monitor_work_area(mon)
+            targets = self._targets_for(mon, mon_wins, mwa)
+            self._animate_to(mon, mon_wins, targets, mwa, time.monotonic())
 
     # ------------------------------------------------------------------
     # Animation step — ~60 fps
@@ -512,10 +580,278 @@ class WindowManager:
 # Layout helpers
 # ---------------------------------------------------------------------------
 
+def _compensate(hwnd: int, rect: Rect) -> Rect:
+    """Extend a logical (visible) rect by the window's invisible DWM shadow
+    insets so the visible frames of adjacent tiles touch exactly.  Top is
+    left alone — modern apps have no shadow above the title bar."""
+    ins = _cached_shadow_insets(hwnd)
+    return (rect[0] - ins[0], rect[1], rect[2] + ins[2], rect[3] + ins[3])
+
+
+# Cached hmonitor → monitor-rect (left, top), used to match config overrides.
+_mon_pos_cache: Dict[int, Tuple[int, int]] = {}
+
+
+def _monitor_override(mon: int) -> dict:
+    """Per-monitor settings override from config.MONITOR_OVERRIDES, or {}."""
+    if not mon or not config.MONITOR_OVERRIDES:
+        return {}
+    pos = _mon_pos_cache.get(mon)
+    if pos is None:
+        try:
+            mr = win32api.GetMonitorInfo(mon)["Monitor"]
+            pos = (mr[0], mr[1])
+        except Exception:
+            pos = (0, 0)
+        _mon_pos_cache[mon] = pos
+    for o in config.MONITOR_OVERRIDES:
+        if o.get("left") == pos[0] and o.get("top") == pos[1]:
+            return o
+    return {}
+
+
+def _effective_mode(mon: int) -> str:
+    return _monitor_override(mon).get("layout_mode") or config.LAYOUT_MODE
+
+
+def _effective_ratio(mon: int) -> float:
+    return float(_monitor_override(mon).get("expand_ratio")
+                 or config.EXPAND_RATIO)
+
+
+def _focus_bias(ratio: float) -> float:
+    """Weight multiplier for the focused window's band and cell, derived
+    from the (per-monitor) expand ratio (65% → ~1.86) and capped by
+    LAYOUT_BIAS_MAX so the focused window can't crush its neighbours."""
+    e = min(0.85, max(0.35, ratio))
+    return max(1.3, min(config.LAYOUT_BIAS_MAX, e / (1.0 - e)))
+
+
+# ---------------------------------------------------------------------------
+# Band engine (see docs/layout-design.md)
+#
+# A layout is an ordered list of bands (columns on landscape, rows on
+# portrait; fgrid uses the transpose).  Windows are assigned to bands
+# positionally and each band stacks its members along the other axis.
+# Focus only stretches weighted boundaries — windows never relocate, which
+# is what keeps hover mode free of feedback loops and makes the gap-free
+# pre-snap measurable for every preset.
+# ---------------------------------------------------------------------------
+
+_PRESETS = ("strip", "quadrant", "triptych", "fgrid")
+
+# Debounce state for count-based preset switching: mwa → [count, since, preset].
+# Keyed by the work-area rect, which is unique per monitor.
+_tier_state: Dict[Rect, list] = {}
+
+
+def _tier_preset(n: int, mode: str) -> str:
+    """Preset for n windows: fixed mode, or the tier table in auto mode."""
+    if mode != "auto":
+        return mode
+    t = config.LAYOUT_TIERS
+    if n <= 2:
+        return t.get("1_2", "strip")
+    if n <= 4:
+        return t.get("3_4", "quadrant")
+    if n <= 6:
+        return t.get("5_6", "triptych")
+    return t.get("7_plus", "fgrid")
+
+
+def _resolve_preset(n: int, mwa: Rect, mon: int = 0) -> str:
+    """Active preset for a monitor (honouring its override), debounced
+    against window-count flapping so a short-lived dialog or splash screen
+    can't thrash the layout."""
+    mode = _effective_mode(mon)
+    now = time.monotonic()
+    st = _tier_state.get(mwa)
+    if st is None:
+        st = [n, now, _tier_preset(n, mode)]
+        _tier_state[mwa] = st
+        return st[2]
+    if st[0] != n:        # count changed — restart the stability timer
+        st[0] = n
+        st[1] = now
+    elif now - st[1] >= config.LAYOUT_DEBOUNCE_MS / 1000.0:
+        st[2] = _tier_preset(n, mode)   # count stable — adopt its preset
+    return st[2]
+
+
+def _band_caps(n: int, k: int, large_first: bool) -> List[int]:
+    """Distribute n windows across k bands.  With a remainder, some bands
+    hold fewer windows (and therefore larger cells); large_first puts those
+    bands first (left / top)."""
+    base, extra = divmod(n, k)
+    if large_first:
+        return [base + (1 if i >= k - extra else 0) for i in range(k)]
+    return [base + (1 if i < extra else 0) for i in range(k)]
+
+
+def _preset_geometry(preset: str, mwa: Rect, n: int) -> Tuple[int, bool, bool]:
+    """Return (n_bands, bands_are_columns, large_first) for this monitor."""
+    landscape = (mwa[2] - mwa[0]) >= (mwa[3] - mwa[1])
+    lf = config.LAYOUT_LARGE_FIRST
+    if preset == "quadrant":
+        return min(2, n), landscape, bool(lf.get("quadrant", True))
+    if preset == "triptych":
+        return min(3, n), landscape, bool(lf.get("triptych", True))
+    if preset == "fgrid":
+        return min(2, n), not landscape, bool(lf.get("fgrid", False))
+    return n, landscape, False     # strip: one window per band
+
+
+def _band_structure(
+    mon_wins: Dict[int, WindowState],
+    mwa: Rect,
+    preset: str,
+) -> Tuple[List[List[int]], bool]:
+    """Assign windows to bands positionally.  Returns (bands, bands_are_cols)
+    where bands is a list of ordered hwnd lists.
+
+    Windows are sorted along the band axis by original-rect centre and dealt
+    into bands by capacity, then each band is ordered along the stack axis.
+    original_rect only changes on user drags (adopted while idle), so the
+    assignment is sticky across focus changes — the hover-stability anchor.
+    """
+    n = len(mon_wins)
+    k, cols, large_first = _preset_geometry(preset, mwa, n)
+
+    def cx(kv):
+        return (kv[1].original_rect[0] + kv[1].original_rect[2]) // 2
+
+    def cy(kv):
+        return (kv[1].original_rect[1] + kv[1].original_rect[3]) // 2
+
+    primary = sorted(mon_wins.items(),
+                     key=(lambda kv: (cx(kv), cy(kv))) if cols else
+                         (lambda kv: (cy(kv), cx(kv))))
+    bands: List[List[int]] = []
+    idx = 0
+    for cap in _band_caps(n, k, large_first):
+        chunk = primary[idx:idx + cap]
+        chunk.sort(key=cy if cols else cx)
+        bands.append([h for h, _ in chunk])
+        idx += cap
+    return bands, cols
+
+
+def _emit_bands(
+    bands: List[List[int]],
+    cols: bool,
+    mwa: Rect,
+    band_w: List[float],
+    cell_w: Dict[int, float],
+    gap: int,
+) -> Dict[int, Rect]:
+    """Emit shadow-compensated rects from band/cell weights.
+
+    Boundaries are cumulative floats rounded at emission, so adjacent tiles
+    share the exact same boundary pixel — gap-free at gap=0, evenly spaced
+    otherwise.  Last band/cell snaps to the monitor edge exactly.
+    """
+    if cols:
+        p0, p1, s0, s1 = mwa[0], mwa[2], mwa[1], mwa[3]
+    else:
+        p0, p1, s0, s1 = mwa[1], mwa[3], mwa[0], mwa[2]
+    k = len(bands)
+    psize = (p1 - p0) - (k - 1) * gap
+    sum_b = sum(band_w) or 1.0
+
+    targets: Dict[int, Rect] = {}
+    pa = float(p0)
+    for bi, band in enumerate(bands):
+        pb = float(p1) if bi == k - 1 else pa + psize * band_w[bi] / sum_b
+        m = len(band)
+        ssize = (s1 - s0) - (m - 1) * gap
+        sum_c = sum(cell_w[h] for h in band) or 1.0
+        sa = float(s0)
+        for ci, h in enumerate(band):
+            sb = float(s1) if ci == m - 1 else sa + ssize * cell_w[h] / sum_c
+            if cols:
+                rect = (round(pa), round(sa), round(pb), round(sb))
+            else:
+                rect = (round(sa), round(pa), round(sb), round(pb))
+            targets[h] = _compensate(h, rect)
+            sa = sb + gap
+        pa = pb + gap
+    return targets
+
+
+def _layout_bands_focus(
+    focused_hwnd: Optional[int],
+    mon_wins: Dict[int, WindowState],
+    mwa: Rect,
+    preset: str,
+    ratio: float = 0.65,
+) -> Dict[int, Rect]:
+    """Focus layout for a band preset.  focused_hwnd=None gives the even
+    layout (all weights 1) used by return-to-center."""
+    n = len(mon_wins)
+    if n == 0:
+        return {}
+    if n == 1:
+        h = next(iter(mon_wins))
+        return {h: _compensate(h, mwa)}
+    bands, cols = _band_structure(mon_wins, mwa, preset)
+    bias = _focus_bias(ratio)
+    band_w = [bias if focused_hwnd in band else 1.0 for band in bands]
+    cell_w = {h: (bias if h == focused_hwnd else 1.0) for h in mon_wins}
+    return _emit_bands(bands, cols, mwa, band_w, cell_w, config.LAYOUT_GAP_PX)
+
+
+def _current_tiled_bands(
+    mon_wins: Dict[int, WindowState],
+    mwa: Rect,
+    preset: str,
+) -> Dict[int, Rect]:
+    """Pre-snap state for band presets: the same band structure with weights
+    measured from the windows' current logical sizes.  Both this snap and
+    the focus target share boundary structure, so the strip layout's
+    gap-free animation guarantee carries over."""
+    n = len(mon_wins)
+    if n <= 1:
+        return _layout_bands_focus(None, mon_wins, mwa, preset)
+    bands, cols = _band_structure(mon_wins, mwa, preset)
+
+    def logical(h, horizontal):
+        s   = mon_wins[h]
+        ins = _cached_shadow_insets(h)
+        if horizontal:
+            return max(1, s.current_rect[2] - s.current_rect[0] - ins[0] - ins[2])
+        return max(1, s.current_rect[3] - s.current_rect[1] - ins[3])
+
+    band_w: List[float] = []
+    cell_w: Dict[int, float] = {}
+    for band in bands:
+        sizes = []
+        for h in band:
+            sizes.append(logical(h, cols))
+            cell_w[h] = logical(h, not cols)
+        band_w.append(sum(sizes) / len(sizes))
+    return _emit_bands(bands, cols, mwa, band_w, cell_w, config.LAYOUT_GAP_PX)
+
+
 def _layout_focus_targets(
     focused_hwnd: int,
     mon_wins: Dict[int, WindowState],
     mwa: Rect,
+    mon: int = 0,
+) -> Dict[int, Rect]:
+    """Dispatch to the monitor's active preset (override-aware mode/tier
+    table + count debounce) with its effective expand ratio."""
+    preset = _resolve_preset(len(mon_wins), mwa, mon)
+    ratio  = _effective_ratio(mon)
+    if preset == "strip":
+        return _layout_strip(focused_hwnd, mon_wins, mwa, ratio)
+    return _layout_bands_focus(focused_hwnd, mon_wins, mwa, preset, ratio)
+
+
+def _layout_strip(
+    focused_hwnd: int,
+    mon_wins: Dict[int, WindowState],
+    mwa: Rect,
+    ratio: float = 0.65,
 ) -> Dict[int, Rect]:
     """
     True tiling layout: windows are placed as contiguous, gap-free tiles.
@@ -552,7 +888,7 @@ def _layout_focus_targets(
         # Formula derivation: let k = E/(1-E) (the focused:other ratio from config).
         # With N total windows: focused = k/(k + N-1), each other = 1/(k + N-1).
         if n_others:
-            k = config.EXPAND_RATIO / max(1e-6, 1.0 - config.EXPAND_RATIO)
+            k = ratio / max(1e-6, 1.0 - ratio)
             effective_ratio = k / (k + n_others)
             focused_w = max(
                 config.MIN_WINDOW_WIDTH,
@@ -560,7 +896,7 @@ def _layout_focus_targets(
                     mw - n_others * config.MIN_WINDOW_WIDTH),
             )
         else:
-            focused_w = int(mw * config.EXPAND_RATIO)
+            focused_w = int(mw * ratio)
         remaining = mw - focused_w
 
         # All non-focused windows get an equal share (see symmetry note above).
@@ -572,9 +908,15 @@ def _layout_focus_targets(
         targets: Dict[int, Rect] = {}
         x = mwa[0]
         for i, (h, _) in enumerate(ordered):
-            w = widths[h]
+            w   = widths[h]
+            ins = _cached_shadow_insets(h)
+            # Extend each rect by the window's invisible left/right DWM shadow
+            # insets so the *visible* frames of adjacent tiles touch exactly —
+            # the same compensation the portrait branch applies to the bottom
+            # edge.  x tracks logical (visible) positions; only the emitted
+            # rect is widened, so insets never accumulate across tiles.
             r = mwa[2] if i == len(ordered) - 1 else x + w
-            targets[h] = (x, mwa[1], r, mwa[3])
+            targets[h] = (x - ins[0], mwa[1], r + ins[2], mwa[3])
             x = r
         return targets
 
@@ -588,7 +930,7 @@ def _layout_focus_targets(
 
         # Same constant-ratio scaling as landscape.
         if n_others:
-            k = config.EXPAND_RATIO / max(1e-6, 1.0 - config.EXPAND_RATIO)
+            k = ratio / max(1e-6, 1.0 - ratio)
             effective_ratio = k / (k + n_others)
             focused_h = max(
                 config.MIN_WINDOW_HEIGHT,
@@ -596,7 +938,7 @@ def _layout_focus_targets(
                     mh - n_others * config.MIN_WINDOW_HEIGHT),
             )
         else:
-            focused_h = int(mh * config.EXPAND_RATIO)
+            focused_h = int(mh * ratio)
         remaining = mh - focused_h
 
         # Equal share for each non-focused window.
@@ -632,12 +974,18 @@ def _layout_focus_targets(
 def _layout_even(
     mon_wins: Dict[int, WindowState],
     mwa: Rect,
+    mon: int = 0,
 ) -> Dict[int, Rect]:
     """Even, gap-free split — every window gets an equal share of the monitor.
 
-    Ordering and edge/shadow handling mirror _layout_focus_targets so the
+    Ordering and edge/shadow handling mirror the focus layouts so the
     return-to-center layout is visually consistent with focus tiling.
     """
+    preset = _resolve_preset(len(mon_wins), mwa, mon)
+    if preset != "strip":
+        return _layout_bands_focus(None, mon_wins, mwa, preset,
+                                   _effective_ratio(mon))
+
     mw = mwa[2] - mwa[0]
     mh = mwa[3] - mwa[1]
     n = len(mon_wins)
@@ -653,8 +1001,10 @@ def _layout_even(
         targets: Dict[int, Rect] = {}
         x = mwa[0]
         for i, (h, _) in enumerate(ordered):
+            ins = _cached_shadow_insets(h)
             r = mwa[2] if i == n - 1 else x + each
-            targets[h] = (x, mwa[1], r, mwa[3])
+            # Same left/right shadow compensation as _layout_focus_targets.
+            targets[h] = (x - ins[0], mwa[1], r + ins[2], mwa[3])
             x = r
         return targets
 
@@ -677,6 +1027,7 @@ def _layout_even(
 def _compute_current_tiled(
     mon_wins: Dict[int, WindowState],
     mwa: Rect,
+    mon: int = 0,
 ) -> Dict[int, Rect]:
     """
     Arrange windows as contiguous tiles using their *current* proportional
@@ -690,7 +1041,14 @@ def _compute_current_tiled(
     Edge case: if a window is already mid-animation its current_rect is
     the mid-point, so the snap lands exactly where it is visually and the
     new animation continues from there seamlessly.
+
+    Band presets get the same guarantee via _current_tiled_bands, which
+    measures band/cell weights from the windows' current logical sizes.
     """
+    preset = _resolve_preset(len(mon_wins), mwa, mon)
+    if preset != "strip":
+        return _current_tiled_bands(mon_wins, mwa, preset)
+
     mw = mwa[2] - mwa[0]
     mh = mwa[3] - mwa[1]
 
@@ -699,24 +1057,34 @@ def _compute_current_tiled(
             mon_wins.items(),
             key=lambda kv: (kv[1].original_rect[0] + kv[1].original_rect[2]) // 2,
         )
-        n        = len(ordered)
-        total_cw = sum(max(1, s.current_rect[2] - s.current_rect[0])
-                       for _, s in ordered) or 1
+        n          = len(ordered)
+        insets_map = {h: _cached_shadow_insets(h) for h, _ in ordered}
+        # Strip the invisible left/right shadow insets so proportions are
+        # computed from the logical (visible) width, not the physical rect.
+        total_cw = sum(
+            max(1, s.current_rect[2] - s.current_rect[0]
+                   - insets_map[h][0] - insets_map[h][2])
+            for h, s in ordered
+        ) or 1
         min_w    = config.MIN_WINDOW_WIDTH   # hoist: avoid repeated attribute lookup in loop
         targets: Dict[int, Rect] = {}
         x      = mwa[0]
         budget = mw
         for i, (h, s) in enumerate(ordered):
+            ins = insets_map[h]
             if i == n - 1:
                 r = mwa[2]   # last tile always snaps to monitor edge
             else:
-                cw     = max(1, s.current_rect[2] - s.current_rect[0])
+                cw     = max(1, s.current_rect[2] - s.current_rect[0]
+                                - ins[0] - ins[2])
                 n_left = n - i
                 cap    = budget - (n_left - 1) * min_w
                 w      = max(min_w, min(round(mw * cw / total_cw), cap))
                 budget -= w
                 r = x + w
-            targets[h] = (x, mwa[1], r, mwa[3])
+            # Same left/right shadow compensation as _layout_focus_targets,
+            # so the snap state and the animation target line up exactly.
+            targets[h] = (x - ins[0], mwa[1], r + ins[2], mwa[3])
             x = r
         return targets
 
@@ -891,8 +1259,10 @@ def _get_monitor(hwnd: int) -> int:
 
 
 def _monitor_work_area(hmonitor: int) -> Rect:
-    if hmonitor in _work_area_cache:
-        return _work_area_cache[hmonitor]
+    now    = time.monotonic()
+    cached = _work_area_cache.get(hmonitor)
+    if cached is not None and now - cached[1] < _WORK_AREA_TTL_S:
+        return cached[0]
     try:
         info = win32api.GetMonitorInfo(hmonitor)
         wa   = info["Work"]
@@ -901,15 +1271,29 @@ def _monitor_work_area(hmonitor: int) -> Rect:
         sw = win32api.GetSystemMetrics(win32con.SM_CXSCREEN)
         sh = win32api.GetSystemMetrics(win32con.SM_CYSCREEN)
         result = (0, 0, sw, sh)
-    _work_area_cache[hmonitor] = result
+    _work_area_cache[hmonitor] = (result, now)
     return result
+
+
+def _is_cloaked(hwnd: int) -> bool:
+    """True if DWM reports the window as cloaked — technically visible to
+    IsWindowVisible but hidden from the user (another virtual desktop,
+    shell-suspended UWP app, etc.)."""
+    try:
+        cloaked = ctypes.c_int(0)
+        hr = ctypes.windll.dwmapi.DwmGetWindowAttribute(
+            hwnd, _DWMWA_CLOAKED, ctypes.byref(cloaked), ctypes.sizeof(cloaked))
+        return hr == 0 and bool(cloaked.value)
+    except Exception:
+        return False
 
 
 def _quick_is_still_manageable(hwnd: int) -> bool:
     """Fast re-validation for windows already tracked as managed.
 
-    Skips expensive class/exe/style/DWM queries — only rechecks conditions
-    that can change after a window is first admitted (visibility, iconic, maximized).
+    Skips expensive class/exe/style queries — only rechecks conditions that
+    can change after a window is first admitted (visibility, iconic,
+    maximized, cloaked).
     """
     try:
         if not win32gui.IsWindowVisible(hwnd):
@@ -917,6 +1301,10 @@ def _quick_is_still_manageable(hwnd: int) -> bool:
         if win32gui.IsIconic(hwnd):
             return False
         if win32gui.GetWindowPlacement(hwnd)[1] == win32con.SW_SHOWMAXIMIZED:
+            return False
+        # A window moved to another virtual desktop becomes cloaked but stays
+        # "visible" — without this recheck it keeps consuming a tile slot.
+        if _is_cloaked(hwnd):
             return False
         return True
     except Exception:
@@ -939,9 +1327,6 @@ def _enumerate_managed(skip: frozenset = frozenset()) -> List[int]:
     except Exception as exc:
         log.error("EnumWindows: %s", exc)
     return results
-
-
-_DWMWA_CLOAKED = 14   # DwmGetWindowAttribute attribute: non-zero → window is cloaked
 
 
 def _get_exe_name(hwnd: int) -> str:
@@ -1043,16 +1428,9 @@ def _is_manageable(hwnd: int) -> bool:
     # but are hidden by DWM — background UWP apps, windows on other virtual
     # desktops, shell-suspended apps, etc.  They pass every other filter but
     # are invisible to the user and create phantom tile slots.
-    try:
-        cloaked = ctypes.c_int(0)
-        hr = ctypes.windll.dwmapi.DwmGetWindowAttribute(
-            hwnd, _DWMWA_CLOAKED, ctypes.byref(cloaked), ctypes.sizeof(cloaked))
-        if hr == 0 and cloaked.value:
-            log.debug("Skipping cloaked window hwnd=%d  cls=%r  cloaked=0x%x",
-                      hwnd, cls, cloaked.value)
-            return False
-    except Exception:
-        pass
+    if _is_cloaked(hwnd):
+        log.debug("Skipping cloaked window hwnd=%d  cls=%r", hwnd, cls)
+        return False
 
     try:
         if win32gui.GetWindowPlacement(hwnd)[1] == win32con.SW_SHOWMAXIMIZED:

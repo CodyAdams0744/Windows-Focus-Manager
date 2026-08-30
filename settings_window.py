@@ -11,7 +11,7 @@ Run standalone for development (instant feedback, no rebuild):
 import sys
 
 from PySide6.QtCore import (
-    Qt, Signal, QTimer, QRect, QRectF, QPropertyAnimation,
+    Qt, Signal, QTimer, QRect, QRectF, QPoint, QSize, QPropertyAnimation,
     QParallelAnimationGroup, QVariantAnimation, QEasingCurve,
 )
 from PySide6.QtGui import (
@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QSpinBox, QComboBox, QPushButton, QLineEdit, QSlider,
     QListWidget, QListWidgetItem, QFrame, QSizePolicy, QGraphicsOpacityEffect,
-    QStackedWidget,
+    QStackedWidget, QScrollArea,
 )
 
 import config_io
@@ -59,6 +59,15 @@ QLabel { background: transparent; }
               color: rgba(240,238,255,0.52); }
 #Nav::item:selected        { background: rgba(167,139,250,0.16); color: rgba(248,247,255,0.96); }
 #Nav::item:hover:!selected { background: rgba(255,255,255,0.05); }
+
+/* Sidebar nav (page-based) + gliding selection pill */
+#NavItem { background: transparent; border: none; text-align: left;
+           padding: 12px 14px; border-radius: 11px;
+           color: rgba(240,238,255,0.62); font-size: 14px; }
+#NavItem:checked        { color: rgba(248,247,255,0.97); }
+#NavItem:hover:!checked { color: rgba(248,247,255,0.85); }
+#NavPill { background: rgba(167,139,250,0.20);
+           border: 1px solid rgba(167,139,250,0.34); border-radius: 11px; }
 
 /* Tiles */
 #Tile               { background: rgba(255,255,255,0.035);
@@ -547,6 +556,380 @@ class _WelcomeStage(QWidget):
         group.start()
 
 
+class MonitorMap(QWidget):
+    """A scaled spatial map of the displays — like Windows' Display settings.
+    Each display sits at its real relative position/size and is a clickable
+    tile that toggles tiling on/off for that monitor."""
+
+    def __init__(self, monitors: list, window) -> None:
+        super().__init__()
+        self.setObjectName("Row")
+        self._window = window
+        self._items = []          # (monitor, button)
+        self.setMinimumHeight(240)
+        for m in monitors:
+            b = QPushButton(self)
+            b.setObjectName("MonTile")
+            b.setCheckable(True)
+            b.setCursor(Qt.PointingHandCursor)
+            star = "  ★" if m.get("primary") else ""
+            num = m.get("number", m.get("index", 0) + 1)
+            b.setText(f"{num}{star}\n{m['width']}×{m['height']}")
+            b.setChecked(window._is_enabled(m))
+            b.clicked.connect(lambda _c, mm=m, bb=b: window._toggle_monitor(mm, bb))
+            self._items.append((m, b))
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._relayout()
+
+    def _relayout(self) -> None:
+        if not self._items or self.width() < 20:
+            return
+        mons = [m for m, _ in self._items]
+        minL = min(m["left"] for m in mons)
+        minT = min(m["top"] for m in mons)
+        vw = max(1, max(m["left"] + m["width"] for m in mons) - minL)
+        vh = max(1, max(m["top"] + m["height"] for m in mons) - minT)
+        pad = 6
+        aw = self.width() - 2 * pad
+        ah = self.height() - 2 * pad
+        if aw < 10 or ah < 10:
+            return
+        scale = min(aw / vw, ah / vh)
+        ox = pad + (aw - vw * scale) / 2
+        oy = pad + (ah - vh * scale) / 2
+        gap = 3
+        for m, b in self._items:
+            x = ox + (m["left"] - minL) * scale
+            y = oy + (m["top"] - minT) * scale
+            b.setGeometry(round(x + gap), round(y + gap),
+                          max(28, round(m["width"] * scale - 2 * gap)),
+                          max(24, round(m["height"] * scale - 2 * gap)))
+
+
+class LayoutPreview(QWidget):
+    """Live diagram of the band-engine layout: draws the chosen preset for N
+    windows, the focused window biased by the expand ratio.  Click a window to
+    move focus and watch the bands restretch — mirrors the real tiler's shapes."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setObjectName("Row")
+        self.setMinimumHeight(200)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setCursor(Qt.PointingHandCursor)
+        self._preset = "strip"
+        self._count = 4
+        self._ratio = 0.65
+        self._cap = 3.2
+        self._gap = 0
+        self._lf = {"quadrant": False, "triptych": True, "fgrid": True}
+        self._focus = 0
+        self._start = {}
+        self._end = {}
+        self._t = 1.0
+        self._anim = None
+
+    def configure(self, preset, count, ratio, large_first, cap, gap) -> None:
+        self._preset = preset
+        self._count = max(1, min(8, int(count)))
+        self._ratio = ratio
+        self._lf = large_first
+        self._cap = cap
+        self._gap = gap
+        if self._focus >= self._count:
+            self._focus = 0
+        self._end = self._layout()
+        self._start = {}
+        self._t = 1.0
+        self.update()
+
+    def _bias(self) -> float:
+        e = min(0.85, max(0.35, self._ratio))
+        return max(1.3, min(self._cap, e / (1.0 - e)))
+
+    def _geometry(self):
+        n, p = self._count, self._preset
+        if p == "quadrant":
+            return min(2, n), True, self._lf.get("quadrant", False)
+        if p == "triptych":
+            return min(3, n), True, self._lf.get("triptych", True)
+        if p == "fgrid":
+            return min(2, n), False, self._lf.get("fgrid", True)
+        return n, True, False     # strip: one window per column
+
+    @staticmethod
+    def _caps(n, k, lf):
+        base, extra = divmod(n, k)
+        if lf:
+            return [base + (1 if i >= k - extra else 0) for i in range(k)]
+        return [base + (1 if i < extra else 0) for i in range(k)]
+
+    def _layout(self) -> dict:
+        n = self._count
+        inner = QRectF(1, 1, self.width() - 2, self.height() - 2).adjusted(12, 12, -12, -12)
+        if n <= 0 or inner.width() < 30 or inner.height() < 24:
+            return {}
+        if n == 1:
+            return {0: QRectF(inner)}
+        k, cols, lf = self._geometry()
+        caps = self._caps(n, k, lf)
+        bands, idx = [], 0
+        for cap in caps:
+            bands.append(list(range(idx, idx + cap)))
+            idx += cap
+        bias = self._bias()
+        band_w = [bias if self._focus in band else 1.0 for band in bands]
+        cell_w = {i: (bias if i == self._focus else 1.0) for i in range(n)}
+        return self._emit(bands, cols, inner, band_w, cell_w, max(3, self._gap))
+
+    @staticmethod
+    def _emit(bands, cols, mwa, band_w, cell_w, gap):
+        if cols:
+            p0, p1, s0, s1 = mwa.left(), mwa.right(), mwa.top(), mwa.bottom()
+        else:
+            p0, p1, s0, s1 = mwa.top(), mwa.bottom(), mwa.left(), mwa.right()
+        k = len(bands)
+        psize = (p1 - p0) - (k - 1) * gap
+        sum_b = sum(band_w) or 1.0
+        res = {}
+        pa = float(p0)
+        for bi, band in enumerate(bands):
+            pb = float(p1) if bi == k - 1 else pa + psize * band_w[bi] / sum_b
+            m = len(band)
+            ssize = (s1 - s0) - (m - 1) * gap
+            sum_c = sum(cell_w[h] for h in band) or 1.0
+            sa = float(s0)
+            for ci, h in enumerate(band):
+                sb = float(s1) if ci == m - 1 else sa + ssize * cell_w[h] / sum_c
+                res[h] = (QRectF(pa, sa, pb - pa, sb - sa) if cols
+                          else QRectF(sa, pa, sb - sa, pb - pa))
+                sa = sb + gap
+            pa = pb + gap
+        return res
+
+    def _rects(self) -> dict:
+        if not self._end:
+            self._end = self._layout()
+        if self._t >= 1.0 or not self._start:
+            return self._end
+        t = self._t
+        out = {}
+        for i, b in self._end.items():
+            a = self._start.get(i, b)
+            out[i] = QRectF(a.x() + (b.x() - a.x()) * t, a.y() + (b.y() - a.y()) * t,
+                            a.width() + (b.width() - a.width()) * t,
+                            a.height() + (b.height() - a.height()) * t)
+        return out
+
+    def _set_focus(self, i: int) -> None:
+        if i == self._focus:
+            return
+        self._start = self._rects()
+        self._focus = i
+        self._end = self._layout()
+        self._t = 0.0
+        anim = QVariantAnimation(self)
+        anim.setDuration(280)
+        anim.setEasingCurve(QEasingCurve.OutCubic)
+        anim.setStartValue(0.0)
+        anim.setEndValue(1.0)
+        anim.valueChanged.connect(self._on_anim)
+        self._anim = anim
+        anim.start()
+
+    def _on_anim(self, val) -> None:
+        self._t = float(val)
+        self.update()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._end = self._layout()
+        self._start = {}
+        self._t = 1.0
+        self.update()
+
+    def mousePressEvent(self, event) -> None:
+        pos = event.position()
+        for i, r in self._rects().items():
+            if r.contains(pos):
+                self._set_focus(i)
+                break
+
+    def paintEvent(self, _event) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        mon = QRectF(1, 1, self.width() - 2, self.height() - 2)
+        p.setPen(QPen(QColor(255, 255, 255, 28), 1))
+        p.setBrush(QColor(0, 0, 0, 70))
+        p.drawRoundedRect(mon, 10, 10)
+        f = QFont("Segoe UI")
+        f.setPointSize(8)
+        f.setBold(True)
+        rects = self._rects()
+        for i in range(self._count):
+            r = rects.get(i)
+            if r is None or r.width() < 6 or r.height() < 6:
+                continue
+            focused = (i == self._focus)
+            if focused:
+                p.setPen(QPen(QColor("#a78bfa"), 1.6))
+                p.setBrush(QColor(167, 139, 250, 32))
+            else:
+                p.setPen(QPen(QColor(255, 255, 255, 22), 1))
+                p.setBrush(QColor(255, 255, 255, 12))
+            p.drawRoundedRect(r, 6, 6)
+            if focused and r.width() > 64 and r.height() > 30:
+                p.setFont(f)
+                p.setPen(QColor("#c4b5fd"))
+                p.drawText(QRectF(r.left() + 9, r.top() + 7, r.width() - 14, 16),
+                           int(Qt.AlignLeft | Qt.AlignVCenter),
+                           f"Focused · {round(self._ratio * 100)}%")
+            if r.width() > 26 and r.height() > 22:
+                p.setPen(Qt.NoPen)
+                p.setBrush(QColor(196, 181, 253, 90) if focused
+                           else QColor(255, 255, 255, 40))
+                ly = r.top() + (28 if focused else 9)
+                fracs = (0.72, 0.86, 0.5) if focused else (0.7, 0.5)
+                for fr in fracs:
+                    if ly + 3 < r.bottom() - 6:
+                        p.drawRoundedRect(
+                            QRectF(r.left() + 9, ly, (r.width() - 18) * fr, 3), 1.5, 1.5)
+                        ly += 7
+        p.end()
+
+
+class NavBar(QWidget):
+    """Sidebar nav with an accent selection pill that glides between items."""
+    selected = Signal(int)
+
+    def __init__(self, items: list) -> None:    # items: [(label, icon_name), ...]
+        super().__init__()
+        self.setObjectName("Nav")
+        self.setFixedWidth(232)
+        self._current = 0
+        self._anim = None
+        self._pill = QFrame(self)
+        self._pill.setObjectName("NavPill")
+        self._buttons = []
+        col = QVBoxLayout(self)
+        col.setContentsMargins(16, 26, 16, 26)
+        col.setSpacing(8)
+        for i, (label, icon) in enumerate(items):
+            b = QPushButton("   " + label)
+            b.setObjectName("NavItem")
+            b.setCheckable(True)
+            b.setCursor(Qt.PointingHandCursor)
+            b.setMinimumHeight(50)
+            if icon:
+                b.setIcon(QIcon(_make_tile_icon(icon, 24)))
+                b.setIconSize(QSize(21, 21))
+            b.clicked.connect(lambda _c, idx=i: self.select(idx))
+            col.addWidget(b)
+            self._buttons.append(b)
+        col.addStretch(1)
+
+    def select(self, idx: int) -> None:
+        if not (0 <= idx < len(self._buttons)):
+            return
+        first = self._pill.width() == 0
+        for i, b in enumerate(self._buttons):
+            b.setChecked(i == idx)
+        changed = idx != self._current
+        self._current = idx
+        self._move_pill(animate=not first)
+        if changed or first:
+            self.selected.emit(idx)
+
+    def _move_pill(self, animate: bool) -> None:
+        b = self._buttons[self._current]
+        target = b.geometry()
+        if not animate or self._pill.width() == 0 or not target.isValid():
+            self._pill.setGeometry(target)
+            self._pill.lower()
+            return
+        if self._anim is not None:
+            self._anim.stop()
+        a = QPropertyAnimation(self._pill, b"geometry", self)
+        a.setDuration(320)
+        a.setEasingCurve(QEasingCurve.OutBack)
+        a.setStartValue(self._pill.geometry())
+        a.setEndValue(target)
+        self._anim = a
+        a.start()
+        self._pill.lower()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        QTimer.singleShot(0, lambda: self._move_pill(animate=False))
+
+
+class PageStack(QWidget):
+    """Holds the settings pages and cross-fades + slides between them."""
+
+    def __init__(self, pages: list) -> None:
+        super().__init__()
+        self._pages = pages
+        self._current = 0
+        self._anim = None
+        for p in pages:
+            p.setParent(self)
+            p.hide()
+        if pages:
+            pages[0].show()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        for p in self._pages:
+            p.setGeometry(0, 0, self.width(), self.height())
+
+    def go(self, idx: int) -> None:
+        if idx == self._current or not (0 <= idx < len(self._pages)):
+            return
+        old = self._pages[self._current]
+        new = self._pages[idx]
+        direction = 1 if idx > self._current else -1
+        self._current = idx
+        w, h = self.width(), self.height()
+
+        new.setGeometry(0, 0, w, h)
+        new.move(0, direction * 28)
+        new.show()
+        new.raise_()
+        new_eff = QGraphicsOpacityEffect(new)
+        new.setGraphicsEffect(new_eff)
+        new_eff.setOpacity(0.0)
+        old_eff = QGraphicsOpacityEffect(old)
+        old.setGraphicsEffect(old_eff)
+        old_eff.setOpacity(1.0)
+
+        grp = QParallelAnimationGroup(self)
+        a1 = QPropertyAnimation(new, b"pos")
+        a1.setDuration(320)
+        a1.setEasingCurve(QEasingCurve.OutCubic)
+        a1.setStartValue(new.pos())
+        a1.setEndValue(QPoint(0, 0))
+        a2 = QPropertyAnimation(new_eff, b"opacity")
+        a2.setDuration(280)
+        a2.setStartValue(0.0)
+        a2.setEndValue(1.0)
+        a3 = QPropertyAnimation(old_eff, b"opacity")
+        a3.setDuration(200)
+        a3.setStartValue(1.0)
+        a3.setEndValue(0.0)
+        for a in (a1, a2, a3):
+            grp.addAnimation(a)
+
+        def _done():
+            old.hide()
+            old.setGraphicsEffect(None)
+            new.setGraphicsEffect(None)
+        grp.finished.connect(_done)
+        self._anim = grp
+        grp.start()
+
+
 # ---------------------------------------------------------------------------
 # Main window
 # ---------------------------------------------------------------------------
@@ -575,8 +958,8 @@ class SettingsWindow(QWidget):
         self._collapse_timer.timeout.connect(self._hover_collapse)
 
         self.setWindowTitle("Window Focus Manager — Settings")
-        self.setMinimumSize(1080, 840)
-        self.resize(1140, 880)
+        self.setMinimumSize(1080, 960)
+        self.resize(1140, 1010)
         self.setStyleSheet(STYLE)
         self.setWindowIcon(_app_icon())
 
@@ -596,10 +979,11 @@ class SettingsWindow(QWidget):
         "exclusions": (1, 2, 1, 1),
         "startup":    (2, 2, 1, 1),
         "system":     (3, 2, 1, 1),
+        "layouts":    (0, 3, 4, 1),   # full-width layout engine controls
     }
     _MARGIN = 20
     _GAP = 14
-    _ROW_WEIGHTS = [1.0, 1.0, 1.25]
+    _ROW_WEIGHTS = [1.0, 1.0, 1.25, 1.5]
     _H_BIAS = 1.7    # focused tile's columns grow by this factor (gentle, so
     _V_BIAS = 2.0    # neighbours keep enough room to show their controls)
 
@@ -620,25 +1004,61 @@ class SettingsWindow(QWidget):
         root.setSpacing(0)
         root.addWidget(self._build_header())
 
-        self.canvas = BentoCanvas()
-        self.canvas.resized.connect(lambda: self._relayout(animate=False))
-        self.canvas.bgClicked.connect(self._collapse)
-        root.addWidget(self.canvas, 1)
+        # Build the control cards (each still wires itself to save/load).
+        cards = {
+            "expand":     self._tile_expand(),
+            "monitors":   self._tile_monitors(),
+            "animation":  self._tile_animation(),
+            "hover":      self._tile_hover(),
+            "minsize":    self._tile_minsize(),
+            "exclusions": self._tile_exclusions(),
+            "startup":    self._tile_startup(),
+            "system":     self._tile_system(),
+            "layouts":    self._tile_layouts(),
+        }
+        self._wire_layout_preview()
 
-        # Build the tiles (each registers itself into self._tiles and parents
-        # to the canvas via _tile()).
-        self._tile_expand()
-        self._tile_monitors()
-        self._tile_animation()
-        self._tile_hover()
-        self._tile_minsize()
-        self._tile_exclusions()
-        self._tile_startup()
-        self._tile_system()
+        # Group cards into sidebar pages.
+        pages = [
+            ("Layout",     "layout",  [(cards["expand"], 1), (cards["layouts"], 0)]),
+            ("Monitors",   "monitor", [(cards["monitors"], 1)]),
+            ("Behavior",   "cursor",  [(cards["hover"], 0), (cards["animation"], 0),
+                                       (cards["minsize"], 0), (cards["startup"], 0)]),
+            ("Exclusions", "ban",     [(cards["exclusions"], 0)]),
+            ("System",     "sliders", [(cards["system"], 0)]),
+        ]
 
-        # First layout once the canvas has a real size.
-        QTimer.singleShot(0, lambda: self._relayout(animate=False))
+        body = QHBoxLayout()
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(0)
+        self.nav = NavBar([(label, icon) for label, icon, _ in pages])
+        self.pages = PageStack([self._make_page(group) for _, _, group in pages])
+        self.nav.selected.connect(self.pages.go)
+        body.addWidget(self.nav)
+        body.addWidget(self.pages, 1)
+        root.addLayout(body, 1)
+
+        QTimer.singleShot(0, lambda: self.nav.select(0))
         return page
+
+    def _make_page(self, cards: list) -> QWidget:
+        # cards: list of (widget, stretch).  A card with stretch > 0 grows to
+        # fill the page height; if none grow, a trailing stretch pins them up top.
+        area = QScrollArea()
+        area.setWidgetResizable(True)
+        area.setFrameShape(QFrame.NoFrame)
+        inner = QWidget()
+        col = QVBoxLayout(inner)
+        col.setContentsMargins(36, 30, 36, 30)
+        col.setSpacing(22)
+        total = 0
+        for c, stretch in cards:
+            col.addWidget(c, stretch)
+            total += stretch
+        if total == 0:
+            col.addStretch(1)
+        area.setWidget(inner)
+        return area
 
     # ── Welcome / first-run screen ──────────────────────────────────────
     def _build_welcome(self) -> QWidget:
@@ -736,7 +1156,7 @@ class SettingsWindow(QWidget):
         weights of the columns and rows it spans, so it claims more space and
         its neighbours yield — gap-free, the same idea as the window tiler."""
         w, h = size.width(), size.height()
-        cols, rows = 4, 3
+        cols, rows = 4, len(self._ROW_WEIGHTS)
         col_w = [1.0] * cols
         row_w = list(self._ROW_WEIGHTS)
 
@@ -887,6 +1307,8 @@ class SettingsWindow(QWidget):
             return "On" if self.autostart.isChecked() else "Off"
         if tile_id == "system":
             return f"{self.poll.value()} ms"
+        if tile_id == "layouts":
+            return self._MODE_LABELS[self.layout_mode_combo.currentIndex()]
         return ""
 
     def _on_tile_clicked(self, tile_id: str) -> None:
@@ -967,10 +1389,12 @@ class SettingsWindow(QWidget):
 
     # ── Tile helper ─────────────────────────────────────────────────────
     def _tile(self, tile_id: str, title: str, icon: str = "") -> tuple:
-        frame = Tile(tile_id, self.canvas)
+        """A titled card.  Returns (card_frame, content_layout)."""
+        frame = QFrame()
+        frame.setObjectName("Tile")
         outer = QVBoxLayout(frame)
-        outer.setContentsMargins(16, 16, 16, 16)
-        outer.setSpacing(10)
+        outer.setContentsMargins(26, 22, 26, 24)
+        outer.setSpacing(16)
 
         head = QHBoxLayout()
         head.setContentsMargins(0, 0, 0, 0)
@@ -986,27 +1410,10 @@ class SettingsWindow(QWidget):
         head.addStretch(1)
         outer.addLayout(head)
 
-        # Compact value, shown only when the tile is shrunk.
-        value = QLabel("")
-        value.setObjectName("TileValue")
-        value.setVisible(False)
-        outer.addWidget(value)
-        frame.value_label = value
-
-        # All controls live in a body container so it can be hidden when the
-        # tile is shrunk (another tile focused) — avoids clipped content.
-        body = QWidget()
-        body.setObjectName("Row")
-        v = QVBoxLayout(body)
+        v = QVBoxLayout()
         v.setContentsMargins(0, 0, 0, 0)
         v.setSpacing(10)
-        outer.addWidget(body, 1)
-        frame.body = body
-
-        frame.clicked.connect(lambda i=tile_id: self._on_tile_clicked(i))
-        frame.entered.connect(lambda i=tile_id: self._on_tile_entered(i))
-        frame.left.connect(lambda i=tile_id: self._on_tile_left(i))
-        self._tiles[tile_id] = frame
+        outer.addLayout(v)
         return frame, v
 
     # ── Tiles ───────────────────────────────────────────────────────────
@@ -1020,13 +1427,24 @@ class SettingsWindow(QWidget):
         hint.setWordWrap(True)
         v.addWidget(hint)
 
-        self.preview = TilingPreview()
+        self.preview = LayoutPreview()
         v.addWidget(self.preview, 1)
+
+        pcr = QHBoxLayout()
+        pcl = QLabel("Preview windows")
+        pcl.setObjectName("Hint")
+        pcr.addWidget(pcl)
+        self.preview_count = QSpinBox()
+        self.preview_count.setRange(1, 8)
+        self.preview_count.setValue(4)
+        self.preview_count.setFixedWidth(74)
+        pcr.addWidget(self.preview_count)
+        pcr.addStretch(1)
+        v.addLayout(pcr)
 
         self.expand_slider = QSlider(Qt.Horizontal)
         self.expand_slider.setRange(35, 85)
         self.expand_slider.valueChanged.connect(self._on_ratio_changed)
-        self.expand_slider.valueChanged.connect(self.preview.set_ratio)
         v.addWidget(self.expand_slider)
         chips = QHBoxLayout()
         chips.setSpacing(6)
@@ -1044,31 +1462,46 @@ class SettingsWindow(QWidget):
 
     def _tile_monitors(self) -> QFrame:
         frame, v = self._tile("monitors", "Monitors", "monitor")
-        self._mon_tiles = []
         if not self.monitors:
             v.addWidget(QLabel("No monitors detected."))
             v.addStretch(1)
             return frame
-        row = QHBoxLayout()
-        row.setSpacing(8)
-        for i, m in enumerate(self.monitors):
-            tile = QPushButton()
-            tile.setObjectName("MonTile")
-            tile.setCheckable(True)
-            tile.setMinimumHeight(56)
-            tile.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-            badges = "  ★" if m["primary"] else ""
-            tile.setText(f"{i + 1}{badges}\n{m['width']}×{m['height']}")
-            tile.setChecked(self._is_enabled(m))
-            tile.clicked.connect(
-                lambda _c, mm=m, tt=tile: self._toggle_monitor(mm, tt))
-            row.addWidget(tile)
-            self._mon_tiles.append((m, tile))
-        v.addLayout(row)
+
+        # Spatial map of the displays (matches the Windows Display diagram).
+        self._mon_map = MonitorMap(self.monitors, self)
+        v.addWidget(self._mon_map, 1)
         self.mon_hint = QLabel("")
         self.mon_hint.setObjectName("Hint")
         v.addWidget(self.mon_hint)
-        v.addStretch(1)
+
+        # Per-monitor overrides — "Global" follows the Layouts/Expand tiles.
+        ov_cap = QLabel("Per-monitor layout and ratio")
+        ov_cap.setObjectName("Hint")
+        v.addWidget(ov_cap)
+        self._mon_over = []
+        for m in self.monitors:
+            num = m.get("number", m.get("index", 0) + 1)
+            r = QHBoxLayout()
+            r.setSpacing(8)
+            lab = QLabel(f"{num}{' ★' if m['primary'] else ''}")
+            lab.setObjectName("Hint")
+            lab.setFixedWidth(26)
+            r.addWidget(lab)
+            mode = QComboBox()
+            mode.addItems(["Global layout"] + self._MODE_LABELS)
+            r.addWidget(mode, 1)
+            ratio = QSpinBox()
+            ratio.setRange(34, 85)
+            ratio.setSuffix(" %")
+            ratio.setSpecialValueText("Global ratio")
+            ratio.setFixedWidth(150)
+            ratio.setAlignment(Qt.AlignRight)
+            ratio.setToolTip("Expand ratio for this monitor only; "
+                             "set to minimum for the global value")
+            r.addWidget(ratio)
+            v.addLayout(r)
+            self._mon_over.append((m, mode, ratio))
+        # No trailing stretch: the monitor map (stretch 1 above) fills the card.
         return frame
 
     def _update_mon_hint(self) -> None:
@@ -1113,6 +1546,9 @@ class SettingsWindow(QWidget):
         v.addWidget(self._excl_block(
             "Windows from these apps are never tiled (match by .exe name)",
             "e.g. spotify.exe", which="exe"))
+        v.addWidget(self._excl_block(
+            "Skip windows whose title contains this text",
+            "e.g. Picture-in-Picture", which="title"))
         v.addStretch(1)
         return frame
 
@@ -1139,6 +1575,121 @@ class SettingsWindow(QWidget):
         v.addWidget(_control_row("Log level", self.log_level))
         v.addStretch(1)
         return frame
+
+    # ── Layouts tile (band engine — see docs/layout-design.md) ─────────
+    _MODE_KEYS = ["auto", "strip", "quadrant", "triptych", "fgrid"]
+    _MODE_LABELS = ["Auto · by window count", "Columns", "Quadrants",
+                    "Triptych", "Grid"]
+    _TIER_KEYS = ["1_2", "3_4", "5_6", "7_plus"]
+    _TIER_LABELS = ["1-2 windows", "3-4 windows", "5-6 windows", "7+ windows"]
+
+    @staticmethod
+    def _labeled(caption: str, widget: QWidget) -> QWidget:
+        """A small Hint caption above a control — for packing controls in rows."""
+        box = QWidget()
+        box.setObjectName("Row")
+        v = QVBoxLayout(box)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(3)
+        cap = QLabel(caption)
+        cap.setObjectName("Hint")
+        v.addWidget(cap)
+        v.addWidget(widget)
+        return box
+
+    def _tile_layouts(self) -> QFrame:
+        frame, v = self._tile("layouts", "Layouts", "layout")
+
+        # Row 1 — mode + per-tier preset pickers.
+        row1 = QHBoxLayout()
+        row1.setSpacing(10)
+        self.layout_mode_combo = QComboBox()
+        self.layout_mode_combo.addItems(self._MODE_LABELS)
+        self.layout_mode_combo.currentIndexChanged.connect(self._update_layout_ui)
+        row1.addWidget(self._labeled("Mode", self.layout_mode_combo), 1)
+        self.tier_combos = {}
+        for key, label in zip(self._TIER_KEYS, self._TIER_LABELS):
+            combo = QComboBox()
+            combo.addItems(self._MODE_LABELS[1:])   # presets only, no Auto
+            self.tier_combos[key] = combo
+            row1.addWidget(self._labeled(label, combo), 1)
+        v.addLayout(row1)
+
+        # Row 2 — uneven-count fill order (which side gets the larger cell).
+        row2 = QHBoxLayout()
+        row2.setSpacing(18)
+        self.flip_quadrant = ToggleSwitch()
+        self.flip_triptych = ToggleSwitch()
+        self.flip_fgrid    = ToggleSwitch()
+        for caption, toggle in (
+                ("Large window left · 3-window quadrants", self.flip_quadrant),
+                ("Large window left · 5-window triptych",  self.flip_triptych),
+                ("Roomy row on top · 7-window grid",       self.flip_fgrid)):
+            row2.addWidget(self._labeled(caption, toggle))
+        row2.addStretch(1)
+        v.addLayout(row2)
+
+        # Row 3 — engine tuning sliders.
+        row3 = QHBoxLayout()
+        row3.setSpacing(18)
+        self.bias_slider = SliderRow("Focus dominance cap", 150, 400, " %")
+        self.bias_slider.setToolTip(
+            "Upper limit on how much larger the focused band/cell may get "
+            "relative to its neighbours, regardless of expand ratio")
+        self.gap_slider = SliderRow("Tile gap", 0, 24, " px")
+        self.gap_slider.setToolTip(
+            "Visible spacing between tiles in band layouts (Columns stays gap-free)")
+        self.debounce_slider = SliderRow("Layout switch delay", 0, 2000, " ms")
+        self.debounce_slider.setToolTip(
+            "Window count must stay stable this long before Auto switches "
+            "presets — stops dialogs from thrashing the layout")
+        for s in (self.bias_slider, self.gap_slider, self.debounce_slider):
+            row3.addWidget(s, 1)
+        v.addLayout(row3)
+        v.addStretch(1)
+        return frame
+
+    def _layout_mode_key(self) -> str:
+        return self._MODE_KEYS[self.layout_mode_combo.currentIndex()]
+
+    def _update_layout_ui(self, *_a) -> None:
+        is_auto = self._layout_mode_key() == "auto"
+        for combo in self.tier_combos.values():
+            combo.setEnabled(is_auto)
+        self.debounce_slider.setEnabled(is_auto)
+
+    def _wire_layout_preview(self) -> None:
+        """Connect every layout control to the live preview (called once the
+        Expand and Layouts cards are both built)."""
+        self.expand_slider.valueChanged.connect(self._refresh_layout_preview)
+        self.preview_count.valueChanged.connect(self._refresh_layout_preview)
+        self.layout_mode_combo.currentIndexChanged.connect(self._refresh_layout_preview)
+        for c in self.tier_combos.values():
+            c.currentIndexChanged.connect(self._refresh_layout_preview)
+        for t in (self.flip_quadrant, self.flip_triptych, self.flip_fgrid):
+            t.toggled.connect(self._refresh_layout_preview)
+        self.bias_slider.slider.valueChanged.connect(self._refresh_layout_preview)
+        self.gap_slider.slider.valueChanged.connect(self._refresh_layout_preview)
+
+    def _refresh_layout_preview(self, *_a) -> None:
+        if not isinstance(getattr(self, "preview", None), LayoutPreview):
+            return
+        count = self.preview_count.value()
+        mode = self._layout_mode_key()
+        if mode == "auto":
+            tier = ("1_2" if count <= 2 else "3_4" if count <= 4
+                    else "5_6" if count <= 6 else "7_plus")
+            preset = self._MODE_KEYS[1 + self.tier_combos[tier].currentIndex()]
+        else:
+            preset = mode
+        lf = {
+            "quadrant": self.flip_quadrant.isChecked(),
+            "triptych": self.flip_triptych.isChecked(),
+            "fgrid":    self.flip_fgrid.isChecked(),
+        }
+        self.preview.configure(
+            preset, count, self.expand_slider.value() / 100.0, lf,
+            self.bias_slider.value() / 100.0, self.gap_slider.value())
 
     def _excl_block(self, label: str, placeholder: str, which: str) -> QWidget:
         box = QWidget()
@@ -1224,6 +1775,9 @@ class SettingsWindow(QWidget):
         self._exe_list.clear()
         for it in self.skip_exe:
             self._exe_list.addItem(QListWidgetItem(it))
+        self._title_list.clear()
+        for it in self.skip_titles:
+            self._title_list.addItem(QListWidgetItem(it))
 
     def _remove_exclusion(self, which: str, value: str) -> None:
         target = self.skip_titles if which == "title" else self.skip_exe
@@ -1236,6 +1790,45 @@ class SettingsWindow(QWidget):
         c = self.cfg
         self.expand_slider.setValue(round(float(c.get("expand_ratio", 0.65)) * 100))
         self._on_ratio_changed(self.expand_slider.value())
+        migrate = {"grid": "fgrid", "master": "strip", "columns": "strip"}
+        mode = str(c.get("layout_mode", "auto")).lower()
+        mode = migrate.get(mode, mode)
+        if mode not in self._MODE_KEYS:
+            mode = "auto"
+        self.layout_mode_combo.setCurrentIndex(self._MODE_KEYS.index(mode))
+        tiers = c.get("layout_tiers") or {}
+        tier_defaults = {"1_2": "strip", "3_4": "quadrant",
+                         "5_6": "triptych", "7_plus": "fgrid"}
+        presets = self._MODE_KEYS[1:]
+        for key, combo in self.tier_combos.items():
+            val = str(tiers.get(key, tier_defaults[key])).lower()
+            val = migrate.get(val, val)
+            if val not in presets:
+                val = tier_defaults[key]
+            combo.setCurrentIndex(presets.index(val))
+        lf = c.get("layout_large_first") or {}
+        self.flip_quadrant.setChecked(lf.get("quadrant", True) is not False)
+        self.flip_triptych.setChecked(lf.get("triptych", True) is not False)
+        self.flip_fgrid.setChecked(lf.get("fgrid", False) is True)
+        self.bias_slider.setValue(round(float(c.get("layout_focus_bias_max", 3.2)) * 100))
+        self.gap_slider.setValue(int(c.get("layout_gap_px", 0)))
+        self.debounce_slider.setValue(int(c.get("layout_debounce_ms", 800)))
+        self._update_layout_ui()
+        ovs = c.get("monitor_overrides") or []
+        for m, mode, ratio in getattr(self, "_mon_over", []):
+            o = next((o for o in ovs
+                      if o.get("left") == m["left"] and o.get("top") == m["top"]), {})
+            ov_mode = str(o.get("layout_mode", "")).lower()
+            ov_mode = migrate.get(ov_mode, ov_mode)
+            if ov_mode in self._MODE_KEYS:
+                mode.setCurrentIndex(1 + self._MODE_KEYS.index(ov_mode))
+            else:
+                mode.setCurrentIndex(0)
+            try:
+                rv = float(o.get("expand_ratio", 0))
+            except Exception:
+                rv = 0.0
+            ratio.setValue(round(rv * 100) if 0.35 <= rv <= 0.85 else 34)
         self.min_w.setValue(int(c.get("min_window_width", 200)))
         self.min_h.setValue(int(c.get("min_window_height", 200)))
         self.animate.setChecked(c.get("animate", True) is not False)
@@ -1251,6 +1844,7 @@ class SettingsWindow(QWidget):
         self._render_exclusions()
         self._update_hover_ui(self.hover_enabled.isChecked())
         self._update_mon_hint()
+        self._refresh_layout_preview()
 
     def _update_hover_ui(self, on: bool) -> None:
         self.hover_delay.setEnabled(bool(on))
@@ -1267,9 +1861,32 @@ class SettingsWindow(QWidget):
 
     # ── Save ───────────────────────────────────────────────────────────
     def _save(self) -> None:
-        new = dict(self.cfg)
+        # Merge over the *current* on-disk config (not the snapshot from when
+        # this window opened) so out-of-band changes — e.g. the tray flyout's
+        # hover toggle — aren't overwritten with stale values.
+        new = config_io.load_config()
+        presets = self._MODE_KEYS[1:]
+        overrides = []
+        for m, mode, ratio in getattr(self, "_mon_over", []):
+            o = {"left": m["left"], "top": m["top"]}
+            if mode.currentIndex() > 0:
+                o["layout_mode"] = self._MODE_KEYS[mode.currentIndex() - 1]
+            if ratio.value() > 34:
+                o["expand_ratio"] = ratio.value() / 100.0
+            if len(o) > 2:
+                overrides.append(o)
         new.update({
             "expand_ratio":          self.expand_slider.value() / 100.0,
+            "layout_mode":           self._layout_mode_key(),
+            "layout_tiers":          {key: presets[combo.currentIndex()]
+                                      for key, combo in self.tier_combos.items()},
+            "layout_large_first":    {"quadrant": self.flip_quadrant.isChecked(),
+                                      "triptych": self.flip_triptych.isChecked(),
+                                      "fgrid":    self.flip_fgrid.isChecked()},
+            "layout_focus_bias_max": self.bias_slider.value() / 100.0,
+            "layout_gap_px":         self.gap_slider.value(),
+            "layout_debounce_ms":    self.debounce_slider.value(),
+            "monitor_overrides":     overrides,
             "min_window_width":      self.min_w.value(),
             "min_window_height":     self.min_h.value(),
             "animate":               self.animate.isChecked(),
