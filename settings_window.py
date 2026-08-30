@@ -1510,14 +1510,55 @@ class SettingsWindow(QWidget):
         enabled = sum(1 for m in self.monitors if self._is_enabled(m))
         self.mon_hint.setText(f"{enabled} of {len(self.monitors)} displays tiling")
 
+    # Focus-outline colour presets (label → "#rrggbb").
+    _OUTLINE_COLORS = [
+        ("Lavender", "#a78bfa"),
+        ("Blue",     "#5b9dff"),
+        ("Green",    "#7ee0a8"),
+        ("Amber",    "#ffd166"),
+        ("White",    "#ffffff"),
+    ]
+
     def _tile_animation(self) -> QFrame:
         frame, v = self._tile("animation", "Animation", "motion")
         self.animate = ToggleSwitch()
         v.addWidget(_control_row("Smooth", self.animate))
         self.anim_dur = SliderRow("Duration", 50, 600, " ms")
         v.addWidget(self.anim_dur)
+
+        self.focus_outline = ToggleSwitch()
+        self.focus_outline.toggled.connect(self._update_outline_ui)
+        v.addWidget(_control_row(
+            "Focus outline", self.focus_outline,
+            "Highlight a window while the app resizes it"))
+        self.outline_color = QComboBox()
+        for label, _hex in self._OUTLINE_COLORS:
+            self.outline_color.addItem(label)
+        v.addWidget(_control_row("Outline color", self.outline_color))
+        self.outline_opacity = SliderRow("Opacity", 10, 100, " %")
+        v.addWidget(self.outline_opacity)
+        self.outline_width = SliderRow("Thickness", 1, 12, " px")
+        v.addWidget(self.outline_width)
+
         v.addStretch(1)
         return frame
+
+    def _update_outline_ui(self, on: bool) -> None:
+        for w in (self.outline_color, self.outline_opacity, self.outline_width):
+            w.setEnabled(bool(on))
+
+    def _outline_color_hex(self) -> str:
+        """Current '#rrggbb' from the preset picker."""
+        idx = max(0, self.outline_color.currentIndex())
+        return self._OUTLINE_COLORS[idx][1]
+
+    def _set_outline_color(self, value: str) -> None:
+        want = str(value or "").strip().lower()
+        for i, (_label, hex_) in enumerate(self._OUTLINE_COLORS):
+            if hex_.lower() == want:
+                self.outline_color.setCurrentIndex(i)
+                return
+        self.outline_color.setCurrentIndex(0)
 
     def _tile_hover(self) -> QFrame:
         frame, v = self._tile("hover", "Hover Mode", "cursor")
@@ -1833,6 +1874,12 @@ class SettingsWindow(QWidget):
         self.min_h.setValue(int(c.get("min_window_height", 200)))
         self.animate.setChecked(c.get("animate", True) is not False)
         self.anim_dur.setValue(int(c.get("animation_duration_ms", 125)))
+        self.focus_outline.setChecked(c.get("focus_outline_enabled", False) is True)
+        self._set_outline_color(c.get("focus_outline_color", "#a78bfa"))
+        self.outline_opacity.setValue(
+            round(float(c.get("focus_outline_opacity", 0.55)) * 100))
+        self.outline_width.setValue(int(c.get("focus_outline_width", 3)))
+        self._update_outline_ui(self.focus_outline.isChecked())
         self.hover_enabled.setChecked(c.get("hover_enabled", False) is True)
         self.hover_delay.setValue(int(c.get("hover_delay_ms", 300)))
         self.return_to_center.setChecked(c.get("return_to_center", False) is True)
@@ -1891,6 +1938,10 @@ class SettingsWindow(QWidget):
             "min_window_height":     self.min_h.value(),
             "animate":               self.animate.isChecked(),
             "animation_duration_ms": self.anim_dur.value(),
+            "focus_outline_enabled": self.focus_outline.isChecked(),
+            "focus_outline_color":   self._outline_color_hex(),
+            "focus_outline_opacity": self.outline_opacity.value() / 100.0,
+            "focus_outline_width":   self.outline_width.value(),
             "hover_enabled":         self.hover_enabled.isChecked(),
             "hover_delay_ms":        self.hover_delay.value(),
             "return_to_center":      self.return_to_center.isChecked(),

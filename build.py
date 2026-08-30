@@ -128,11 +128,13 @@ def _build_exe(icon_path: Path | None) -> Path:
         "--windowed",                         # no console window (logs → wfm.log)
         "--name", "WindowFocusManager",
 
-        # The native settings window lives in its own module; PyInstaller follows
-        # the lazy `import settings_window` in main.py, but name it explicitly too.
+        # Modules reached only through lazy `import` inside try/except (main.py
+        # and tray.py) — name them explicitly so PyInstaller can't miss them
+        # and silently ship an exe without the settings window or the outline.
         "--hidden-import", "settings_window",
         "--hidden-import", "config_io",
         "--hidden-import", "tray",
+        "--hidden-import", "focus_outline",
 
         # pywin32 hidden imports that PyInstaller misses
         "--hidden-import", "win32timezone",

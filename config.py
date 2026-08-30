@@ -2,6 +2,14 @@
 
 To open the settings UI:
     python settings_window.py
+
+Live reload
+-----------
+The tiler reads settings as module attributes (``config.EXPAND_RATIO`` etc.).
+Those attributes are served from a single dict, ``_current``, via PEP 562
+``__getattr__``.  ``reload()`` rebuilds that dict from disk and rebinds it in
+one assignment, so a concurrent reader on the tiler thread always sees a
+fully-consistent set of values — never a mix of old and new mid-reload.
 """
 import json
 import logging
@@ -41,6 +49,12 @@ DEFAULTS: dict = {
     # Monitors identified by monitor-rect left/top (same scheme as enabled_monitors).
     # Missing keys / missing entry → the global setting applies.
     "monitor_overrides":     [],
+    # Focus outline: a thin highlight drawn around the focused window while the
+    # tiler is resizing it, so it's obvious the move is app-driven.  Opt-in.
+    "focus_outline_enabled":   False,
+    "focus_outline_color":     "#a78bfa",   # hex "#rrggbb"
+    "focus_outline_opacity":   0.55,        # 0.0 – 1.0
+    "focus_outline_width":     3,           # px, 1 – 12
     "skip_classes": [
         "Shell_TrayWnd", "Progman", "WorkerW", "DV2ControlHost",
         "MsgrIMEWindowClass", "SysShadow", "tooltips_class32",
@@ -60,6 +74,12 @@ if getattr(sys, 'frozen', False):
 else:
     _cfg_path = Path(__file__).parent / "config.json"
 
+_PRESETS = ("strip", "quadrant", "triptych", "fgrid")
+# "grid"/"master" are retired modes from v1.2 — migrate to their successor.
+_MIGRATE = {"grid": "fgrid", "master": "strip", "columns": "strip"}
+
+_HEX_DIGITS = set("0123456789abcdefABCDEF")
+
 
 def _load() -> dict:
     if _cfg_path.exists():
@@ -73,72 +93,74 @@ def _load() -> dict:
     return dict(DEFAULTS)
 
 
-def _apply(cfg: dict) -> None:
-    """Bind cfg values to the module attributes the tiler reads.
+def _valid_hex_color(value, fallback: str) -> str:
+    """Return value if it is a '#rrggbb' string, else fallback."""
+    try:
+        s = str(value).strip()
+        if s.startswith("#") and len(s) == 7 and all(c in _HEX_DIGITS for c in s[1:]):
+            return s.lower()
+    except Exception:
+        pass
+    return fallback
 
-    Called once at import and again by reload().  Updating attributes in
-    place (instead of importlib.reload) avoids re-executing the module while
-    another thread is reading it.
+
+def _build(cfg: dict) -> dict:
+    """Validate cfg and return the flat {ATTR_NAME: value} dict the tiler reads.
+
+    Pure: no module state touched.  reload() swaps the result into place with a
+    single rebinding so readers never observe a half-updated config.
     """
-    global POLL_INTERVAL_MS, ANIM_FRAME_MS, ANIMATION_DURATION_MS, ANIMATE
-    global EXPAND_RATIO, MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT
-    global SKIP_CLASSES, SKIP_TITLES, SKIP_EXE, LOG_LEVEL
-    global HOVER_ENABLED, HOVER_DELAY_MS, RETURN_TO_CENTER, ENABLED_MONITORS
-    global LAYOUT_MODE, LAYOUT_TIERS, LAYOUT_LARGE_FIRST
-    global LAYOUT_BIAS_MAX, LAYOUT_GAP_PX, LAYOUT_DEBOUNCE_MS
-    global MONITOR_OVERRIDES
+    c: dict = {}
 
-    POLL_INTERVAL_MS      = int(cfg["poll_interval_ms"])
-    ANIM_FRAME_MS         = int(cfg["anim_frame_ms"])
-    ANIMATION_DURATION_MS = int(cfg["animation_duration_ms"])
-    ANIMATE               = bool(cfg["animate"])
-    EXPAND_RATIO          = float(cfg["expand_ratio"])
-    MIN_WINDOW_WIDTH      = int(cfg["min_window_width"])
-    MIN_WINDOW_HEIGHT     = int(cfg["min_window_height"])
-    SKIP_CLASSES          = frozenset(cfg["skip_classes"])
-    SKIP_TITLES           = tuple(cfg.get("skip_titles", []))
-    SKIP_EXE              = tuple(s.lower() for s in cfg.get("skip_exe", []))
-    LOG_LEVEL             = str(cfg["log_level"])
-    HOVER_ENABLED         = bool(cfg.get("hover_enabled", False))
-    HOVER_DELAY_MS        = int(cfg.get("hover_delay_ms", 300))
-    RETURN_TO_CENTER      = bool(cfg.get("return_to_center", False))
+    c["POLL_INTERVAL_MS"]      = int(cfg["poll_interval_ms"])
+    c["ANIM_FRAME_MS"]         = int(cfg["anim_frame_ms"])
+    c["ANIMATION_DURATION_MS"] = int(cfg["animation_duration_ms"])
+    c["ANIMATE"]               = bool(cfg["animate"])
+    c["EXPAND_RATIO"]          = float(cfg["expand_ratio"])
+    c["MIN_WINDOW_WIDTH"]      = int(cfg["min_window_width"])
+    c["MIN_WINDOW_HEIGHT"]     = int(cfg["min_window_height"])
+    c["SKIP_CLASSES"]          = frozenset(cfg["skip_classes"])
+    c["SKIP_TITLES"]           = tuple(cfg.get("skip_titles", []))
+    c["SKIP_EXE"]              = tuple(s.lower() for s in cfg.get("skip_exe", []))
+    c["LOG_LEVEL"]             = str(cfg["log_level"])
+    c["HOVER_ENABLED"]         = bool(cfg.get("hover_enabled", False))
+    c["HOVER_DELAY_MS"]        = int(cfg.get("hover_delay_ms", 300))
+    c["RETURN_TO_CENTER"]      = bool(cfg.get("return_to_center", False))
     # None = all monitors; list of {"left": x, "top": y} = only those monitors
-    ENABLED_MONITORS      = cfg.get("enabled_monitors") or None
-    # Tiling layouts (see docs/layout-design.md).  "grid"/"master" are
-    # retired modes from v1.2 — migrate them to their nearest successor.
-    presets = ("strip", "quadrant", "triptych", "fgrid")
-    migrate = {"grid": "fgrid", "master": "strip", "columns": "strip"}
+    c["ENABLED_MONITORS"]      = cfg.get("enabled_monitors") or None
 
+    # Tiling layouts (see docs/layout-design.md).
     mode = str(cfg.get("layout_mode", "auto")).lower()
-    mode = migrate.get(mode, mode)
-    LAYOUT_MODE = mode if mode in presets + ("auto",) else "auto"
+    mode = _MIGRATE.get(mode, mode)
+    c["LAYOUT_MODE"] = mode if mode in _PRESETS + ("auto",) else "auto"
 
     tiers_in = cfg.get("layout_tiers") or {}
-    LAYOUT_TIERS = {}
+    tiers: dict = {}
     for key, dflt in (("1_2", "strip"), ("3_4", "quadrant"),
                       ("5_6", "triptych"), ("7_plus", "fgrid")):
         v = str(tiers_in.get(key, dflt)).lower()
-        v = migrate.get(v, v)
-        LAYOUT_TIERS[key] = v if v in presets else dflt
+        v = _MIGRATE.get(v, v)
+        tiers[key] = v if v in _PRESETS else dflt
+    c["LAYOUT_TIERS"] = tiers
 
     lf = cfg.get("layout_large_first") or {}
-    LAYOUT_LARGE_FIRST = {
+    c["LAYOUT_LARGE_FIRST"] = {
         "quadrant": bool(lf.get("quadrant", True)),
         "triptych": bool(lf.get("triptych", True)),
         "fgrid":    bool(lf.get("fgrid", False)),
     }
 
-    LAYOUT_BIAS_MAX    = max(1.3, min(6.0, float(cfg.get("layout_focus_bias_max", 3.2))))
-    LAYOUT_GAP_PX      = max(0, min(48, int(cfg.get("layout_gap_px", 0))))
-    LAYOUT_DEBOUNCE_MS = max(0, min(5000, int(cfg.get("layout_debounce_ms", 800))))
+    c["LAYOUT_BIAS_MAX"]    = max(1.3, min(6.0, float(cfg.get("layout_focus_bias_max", 3.2))))
+    c["LAYOUT_GAP_PX"]      = max(0, min(48, int(cfg.get("layout_gap_px", 0))))
+    c["LAYOUT_DEBOUNCE_MS"] = max(0, min(5000, int(cfg.get("layout_debounce_ms", 800))))
 
     overrides = []
     for o in (cfg.get("monitor_overrides") or []):
         try:
             entry = {"left": int(o["left"]), "top": int(o["top"])}
-            ov_mode = migrate.get(str(o.get("layout_mode", "")).lower(),
-                                  str(o.get("layout_mode", "")).lower())
-            if ov_mode in presets + ("auto",):
+            ov_mode = _MIGRATE.get(str(o.get("layout_mode", "")).lower(),
+                                   str(o.get("layout_mode", "")).lower())
+            if ov_mode in _PRESETS + ("auto",):
                 entry["layout_mode"] = ov_mode
             if "expand_ratio" in o:
                 entry["expand_ratio"] = max(0.35, min(0.85, float(o["expand_ratio"])))
@@ -146,12 +168,43 @@ def _apply(cfg: dict) -> None:
                 overrides.append(entry)
         except Exception:
             continue
-    MONITOR_OVERRIDES = overrides
+    c["MONITOR_OVERRIDES"] = overrides
+
+    # Focus outline (opt-in UX feature).
+    c["FOCUS_OUTLINE_ENABLED"]   = bool(cfg.get("focus_outline_enabled", False))
+    c["FOCUS_OUTLINE_COLOR"]     = _valid_hex_color(
+        cfg.get("focus_outline_color", "#a78bfa"), "#a78bfa")
+    try:
+        _op = float(cfg.get("focus_outline_opacity", 0.55))
+    except Exception:
+        _op = 0.55
+    c["FOCUS_OUTLINE_OPACITY"]   = max(0.05, min(1.0, _op))
+    try:
+        _ow = int(cfg.get("focus_outline_width", 3))
+    except Exception:
+        _ow = 3
+    c["FOCUS_OUTLINE_WIDTH"]     = max(1, min(12, _ow))
+
+    return c
+
+
+_current: dict = _build(_load())   # resolve settings at import
+
+
+def __getattr__(name: str):
+    """PEP 562 module attribute access — serve settings from the live dict."""
+    try:
+        return _current[name]
+    except KeyError:
+        raise AttributeError(f"module 'config' has no attribute {name!r}")
+
+
+def as_dict() -> dict:
+    """A copy of the currently-applied settings (debugging / diagnostics)."""
+    return dict(_current)
 
 
 def reload() -> None:
-    """Re-read config.json and update module attributes in place."""
-    _apply(_load())
-
-
-_apply(_load())   # bind settings at import
+    """Re-read config.json and swap in the new settings atomically."""
+    global _current
+    _current = _build(_load())

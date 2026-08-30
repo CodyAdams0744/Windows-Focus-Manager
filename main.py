@@ -23,6 +23,91 @@ else:
 
 _CONFIG_JSON = _BASE_DIR / "config.json"
 
+# Handle for the single-instance mutex.  Kept in a module global so it lives
+# for the whole process — releasing it (or letting it be GC'd) would drop the
+# guard and let a second instance start.
+_SINGLE_INSTANCE_MUTEX = None
+
+# Named mutex identifying a running instance, and the Win32 error returned by
+# CreateMutexW when one already exists.
+_MUTEX_NAME = "WindowFocusManager_SingleInstance"
+_ERROR_ALREADY_EXISTS = 183
+
+
+def _acquire_single_instance() -> bool:
+    """Create the named single-instance mutex.
+
+    Returns True if this is the only instance (mutex acquired), False if
+    another instance already holds it.  Fails open: if the mutex cannot be
+    created at all, returns True so the app still starts.
+    """
+    global _SINGLE_INSTANCE_MUTEX
+    try:
+        kernel32 = ctypes.windll.kernel32
+        kernel32.CreateMutexW.restype = ctypes.c_void_p
+        kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                          ctypes.c_wchar_p]
+        handle = kernel32.CreateMutexW(None, False, _MUTEX_NAME)
+        if not handle:
+            return True
+        if kernel32.GetLastError() == _ERROR_ALREADY_EXISTS:
+            return False
+        _SINGLE_INSTANCE_MUTEX = handle
+        return True
+    except Exception:
+        return True
+
+
+def _install_excepthooks(log: logging.Logger) -> None:
+    """Route otherwise-unhandled exceptions (main thread and worker threads)
+    to the root logger with a full traceback.  KeyboardInterrupt is passed
+    straight through to the original hooks."""
+    root = logging.getLogger()
+
+    _orig_sys_hook = sys.excepthook
+
+    def _sys_excepthook(exc_type, exc_value, exc_tb) -> None:
+        if issubclass(exc_type, KeyboardInterrupt):
+            _orig_sys_hook(exc_type, exc_value, exc_tb)
+            return
+        root.critical("Unhandled exception in main thread",
+                      exc_info=(exc_type, exc_value, exc_tb))
+
+    sys.excepthook = _sys_excepthook
+
+    _orig_thread_hook = threading.excepthook
+
+    def _thread_excepthook(args) -> None:
+        if issubclass(args.exc_type, KeyboardInterrupt):
+            _orig_thread_hook(args)
+            return
+        name = args.thread.name if args.thread is not None else "<unknown>"
+        root.critical("Unhandled exception in thread %r", name,
+                      exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
+
+    threading.excepthook = _thread_excepthook
+
+
+def _watchdog(log: logging.Logger, manager, tiler: threading.Thread) -> None:
+    """Restart the tiler thread if it ever dies.  Gives up after 5 restarts."""
+    max_restarts = 5
+    restarts = 0
+    current = tiler
+    while True:
+        time.sleep(2.0)
+        if current.is_alive():
+            continue
+        if restarts >= max_restarts:
+            log.error("Tiler thread has died 5 times — giving up; "
+                      "restart the app.")
+            return
+        restarts += 1
+        log.error("Tiler thread is not alive — restarting (%d/%d).",
+                  restarts, max_restarts)
+        current = threading.Thread(target=manager.run, daemon=True,
+                                   name="tiler")
+        current.start()
+
 
 # ---------------------------------------------------------------------------
 # Config file watcher — live-reloads settings without restarting
@@ -157,22 +242,33 @@ def _check_deps() -> None:
 
 
 def _setup_logging(level_name: str) -> None:
-    """Configure logging.  Frozen exe → rotating file log.  Dev → stderr."""
+    """Configure logging.
+
+    Always writes a rotating ``wfm.log`` next to the exe / script, so a
+    windowless launch (frozen exe, or ``pythonw main.py`` from an autostart
+    entry) still leaves a trail.  When not frozen and a console is attached,
+    also echo to stderr for live dev feedback.
+    """
     level = getattr(logging, level_name, logging.INFO)
     fmt   = "%(asctime)s  %(levelname)-8s  %(message)s"
     dt    = "%H:%M:%S"
 
-    if getattr(sys, 'frozen', False):
-        log_path = _BASE_DIR / "wfm.log"
-        handler  = logging.handlers.RotatingFileHandler(
-            log_path, maxBytes=2 * 1024 * 1024, backupCount=3, encoding="utf-8")
-    else:
-        handler = logging.StreamHandler()
+    handlers: list = []
+    try:
+        handlers.append(logging.handlers.RotatingFileHandler(
+            _BASE_DIR / "wfm.log", maxBytes=2 * 1024 * 1024,
+            backupCount=3, encoding="utf-8"))
+    except Exception:
+        pass
+    if not getattr(sys, 'frozen', False) and sys.stderr is not None:
+        handlers.append(logging.StreamHandler())
+    if not handlers:
+        handlers.append(logging.StreamHandler())
 
     # force=True replaces any handlers a 3rd-party import may have added,
     # preventing duplicate log lines.
     logging.basicConfig(level=level, format=fmt, datefmt=dt,
-                        handlers=[handler], force=True)
+                        handlers=handlers, force=True)
 
 
 # ---------------------------------------------------------------------------
@@ -184,11 +280,19 @@ def main() -> None:
     _check_deps()
 
     import config
-    from window_manager import WindowManager
+    from window_manager import WindowManager, start_event_hooks
 
     _setup_logging(config.LOG_LEVEL)
 
     log = logging.getLogger(__name__)
+
+    # Refuse to start a second copy — two tilers fighting over the same
+    # windows produces relentless flicker.  (--settings is never gated.)
+    if not _acquire_single_instance():
+        log.warning("Another instance is already running — exiting.")
+        sys.exit(0)
+
+    _install_excepthooks(log)
     log.info("=" * 56)
     log.info("Windows Focus Manager")
     if getattr(sys, 'frozen', False):
@@ -206,14 +310,39 @@ def main() -> None:
 
     manager = WindowManager()
 
+    # Optional focus-outline overlay (opt-in).  The controller runs on its own
+    # thread and honours config.FOCUS_OUTLINE_ENABLED internally — it draws
+    # nothing until the user turns it on in Settings.  Independent of the tiler
+    # thread's lifecycle (it attaches via the manager's focus observer).
+    try:
+        import focus_outline
+        focus_outline.attach(manager)
+    except Exception as exc:
+        log.debug("Focus outline overlay unavailable: %s", exc)
+
     watcher = threading.Thread(target=_watch_config, args=(log,),
                                daemon=True, name="config-watcher")
     watcher.start()
+
+    # Event-driven foreground detection + display-topology handling.  Runs on
+    # its own daemon thread (a Win32 message loop); a failure here is not
+    # fatal — the tiler still polls the foreground window every frame.
+    try:
+        start_event_hooks(manager)
+    except Exception as exc:
+        log.warning("Foreground event hook unavailable (%s) — "
+                    "using poll cadence only.", exc)
 
     # The tiler runs on a background thread so the Qt tray can own the main
     # thread (QSystemTrayIcon + the bento flyout need the Qt event loop).
     tiler = threading.Thread(target=manager.run, daemon=True, name="tiler")
     tiler.start()
+
+    # Watchdog: revive the tiler thread if an unexpected crash slips past its
+    # own per-frame guard.  Daemon so it never holds up exit.
+    watchdog = threading.Thread(target=_watchdog, args=(log, manager, tiler),
+                                daemon=True, name="tiler-watchdog")
+    watchdog.start()
 
     # Open the settings window on first run only — on subsequent launches
     # (including autostart at login) the app starts quietly in the tray.

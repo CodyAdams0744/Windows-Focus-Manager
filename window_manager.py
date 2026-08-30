@@ -33,6 +33,7 @@ import logging
 import os
 import threading
 import time
+from ctypes import wintypes
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -151,6 +152,43 @@ class WindowManager:
         # for each poll/animation step; the tray thread (pause/resume/exit)
         # holds it while restoring — prevents mutation during iteration.
         self._lock = threading.RLock()
+        # Optional observer for the focus-outline feature.  Set via
+        # set_focus_observer(); called from the tiler thread once per animation
+        # frame with {hwnd: current_rect} for each monitor's focused window
+        # while it is being moved (empty dict when nothing is animating).
+        # Must be fast and non-blocking — it runs inside the animation loop.
+        self._focus_observer = None
+        # Latest foreground-change event from the WinEvent hook thread:
+        # (hwnd, time.monotonic()) or None.  The hook thread only writes it;
+        # the tiler thread consumes it once per frame (see run()).  Guarded by
+        # its own tiny lock so the hook thread never contends on self._lock.
+        self._fg_event: Optional[Tuple[int, float]] = None
+        self._fg_lock = threading.Lock()
+        # Owner of the daemon thread hosting the foreground WinEvent hook and
+        # the display-topology watcher window.  Set by start_event_hooks().
+        self._event_hooks: Optional["_EventHooks"] = None
+
+    def set_focus_observer(self, callback) -> None:
+        """Register fn({hwnd: Rect}) -> None, or None to clear.  See _focus_observer."""
+        self._focus_observer = callback
+
+    # ------------------------------------------------------------------
+    # Foreground-change event slot (written by the WinEvent hook thread)
+    # ------------------------------------------------------------------
+
+    def _record_fg_event(self, hwnd: int) -> None:
+        """Record that the foreground window changed.  Called ONLY from the
+        WinEvent hook thread — it must do nothing else with the manager."""
+        with self._fg_lock:
+            self._fg_event = (hwnd, time.monotonic())
+
+    def _take_fg_event(self) -> Optional[Tuple[int, float]]:
+        """Consume and clear the pending foreground-change event, if any.
+        Called once per frame from the tiler thread."""
+        with self._fg_lock:
+            ev = self._fg_event
+            self._fg_event = None
+            return ev
 
     # ------------------------------------------------------------------
     # Pause / Resume (called from the system-tray menu)
@@ -193,22 +231,37 @@ class WindowManager:
 
         try:
             while True:
-                frame_start = time.monotonic()
+                try:
+                    frame_start = time.monotonic()
 
-                with self._lock:
-                    if frame_start - self._last_poll >= config.POLL_INTERVAL_MS / 1000.0:
-                        self._poll(frame_start)
-                        self._last_poll = frame_start
+                    # A foreground-change event (from the WinEvent hook thread)
+                    # forces an immediate poll, bypassing the POLL_INTERVAL_MS
+                    # gate.  The periodic poll below now only paces registry
+                    # sync (open / close / cloak / iconic).
+                    fg_event = self._take_fg_event()
 
-                    self._step_animations(frame_start)
+                    with self._lock:
+                        due = (frame_start - self._last_poll
+                               >= config.POLL_INTERVAL_MS / 1000.0)
+                        if due or fg_event is not None:
+                            self._poll(frame_start)
+                            self._last_poll = frame_start
 
-                elapsed_ms = (time.monotonic() - frame_start) * 1000.0
-                time.sleep(max(0.0, config.ANIM_FRAME_MS - elapsed_ms) / 1000.0)
+                        self._step_animations(frame_start)
+
+                    elapsed_ms = (time.monotonic() - frame_start) * 1000.0
+                    time.sleep(max(0.0, config.ANIM_FRAME_MS - elapsed_ms) / 1000.0)
+
+                except Exception:
+                    log.exception("Tiler frame failed — continuing")
+                    time.sleep(0.5)
 
         except KeyboardInterrupt:
             log.info("Shutting down — restoring all windows.")
             with self._lock:
                 self._restore_all()
+            if self._event_hooks is not None:
+                self._event_hooks.stop()
         finally:
             _winmm.timeEndPeriod(1)
 
@@ -514,6 +567,7 @@ class WindowManager:
             updates.append((hwnd, new_rect))
 
         if not updates:
+            self._notify_focus_observer(())
             return
 
         # Apply all position changes atomically so every window moves in the
@@ -565,6 +619,30 @@ class WindowManager:
                               state.resize_fail_count, hwnd, _safe_title(hwnd))
             except Exception:
                 pass
+
+        self._notify_focus_observer([h for h, _ in updates])
+
+    def _notify_focus_observer(self, moved_hwnds) -> None:
+        """Tell the focus-outline observer which focused windows moved this frame.
+
+        Payload is {hwnd: current_rect} for every window that is the focus of
+        its monitor AND changed position this frame; an empty dict means no
+        focused window is currently being moved (outline should hide).  The
+        callback runs on the tiler thread inside the animation loop — it must
+        return quickly and swallow its own errors.
+        """
+        cb = self._focus_observer
+        if cb is None:
+            return
+        moved = set(moved_hwnds)
+        payload: Dict[int, Rect] = {}
+        for h in self._focused.values():
+            if isinstance(h, int) and h > 0 and h in moved and h in self.states:
+                payload[h] = self.states[h].current_rect
+        try:
+            cb(payload)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Restore on exit
@@ -643,6 +721,23 @@ _PRESETS = ("strip", "quadrant", "triptych", "fgrid")
 # Debounce state for count-based preset switching: mwa → [count, since, preset].
 # Keyed by the work-area rect, which is unique per monitor.
 _tier_state: Dict[Rect, list] = {}
+
+
+def _flush_monitor_caches() -> None:
+    """Drop every cache keyed by monitor geometry.
+
+    Invoked by the display-topology watcher (see _EventHooks) on monitor
+    add / remove / rearrange and on resolution or DPI changes — after such
+    an event the cached monitor handles, monitor positions, work areas and
+    preset-tier debounce timers all describe a layout that no longer exists,
+    which would otherwise strand windows until the 5 s work-area TTL expired
+    (or forever, for the caches that have no TTL).
+    """
+    _monitor_cache.clear()
+    _mon_pos_cache.clear()
+    _work_area_cache.clear()
+    _tier_state.clear()
+    log.debug("Monitor caches flushed after display-topology change.")
 
 
 def _tier_preset(n: int, mode: str) -> str:
@@ -1551,5 +1646,260 @@ def _safe_title(hwnd: Optional[int]) -> str:
         return win32gui.GetWindowText(hwnd) or "<no title>"
     except Exception:
         return "<err>"
+
+
+# ---------------------------------------------------------------------------
+# Event hooks — foreground WinEvent + display-topology watcher
+#
+# One daemon thread owns a single Win32 message loop that serves two jobs:
+#
+#   1. SetWinEventHook(EVENT_SYSTEM_FOREGROUND) — fires the instant the
+#      foreground window changes, so we don't wait up to POLL_INTERVAL_MS to
+#      notice a click / alt-tab.  The callback does NO tiling: it only drops
+#      (hwnd, monotonic()) into WindowManager._fg_event; the tiler thread
+#      picks it up next frame and runs a poll immediately.
+#
+#   2. A hidden top-level window (NOT message-only — broadcast messages such
+#      as WM_DISPLAYCHANGE / WM_SETTINGCHANGE never reach HWND_MESSAGE
+#      windows) that flushes the monitor-geometry caches and resets focus
+#      state when the display topology changes.
+#
+# Every Win32 object (hook, window, class) is created, used, and destroyed on
+# this one thread.  It is a daemon thread so it can never block process exit;
+# stop() posts WM_QUIT for a clean teardown when shutdown is orderly.
+# ---------------------------------------------------------------------------
+
+_user32 = ctypes.windll.user32
+_kernel32 = ctypes.windll.kernel32
+
+_LRESULT = ctypes.c_ssize_t
+
+_EVENT_SYSTEM_FOREGROUND = 0x0003
+_WINEVENT_OUTOFCONTEXT = 0x0000
+_WINEVENT_SKIPOWNPROCESS = 0x0002
+_OBJID_WINDOW = 0x00000000
+
+_WM_DESTROY = 0x0002
+_WM_QUIT = 0x0012
+_WM_SETTINGCHANGE = 0x001A
+_WM_DISPLAYCHANGE = 0x007E
+
+_WNDCLASS_NAME = "WFM_TopologyWatcher"
+_TOPOLOGY_DEBOUNCE_S = 1.0
+
+_WNDPROCTYPE = ctypes.WINFUNCTYPE(
+    _LRESULT, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
+_WINEVENTPROCTYPE = ctypes.WINFUNCTYPE(
+    None, wintypes.HANDLE, wintypes.DWORD, wintypes.HWND,
+    wintypes.LONG, wintypes.LONG, wintypes.DWORD, wintypes.DWORD)
+
+
+class _WNDCLASSW(ctypes.Structure):
+    _fields_ = [
+        ("style",         wintypes.UINT),
+        ("lpfnWndProc",   _WNDPROCTYPE),
+        ("cbClsExtra",    ctypes.c_int),
+        ("cbWndExtra",    ctypes.c_int),
+        ("hInstance",     wintypes.HINSTANCE),
+        ("hIcon",         wintypes.HICON),
+        ("hCursor",       wintypes.HANDLE),
+        ("hbrBackground", wintypes.HBRUSH),
+        ("lpszMenuName",  wintypes.LPCWSTR),
+        ("lpszClassName", wintypes.LPCWSTR),
+    ]
+
+
+_user32.SetWinEventHook.restype = wintypes.HANDLE
+_user32.SetWinEventHook.argtypes = [
+    wintypes.DWORD, wintypes.DWORD, wintypes.HMODULE, _WINEVENTPROCTYPE,
+    wintypes.DWORD, wintypes.DWORD, wintypes.DWORD]
+_user32.UnhookWinEvent.restype = wintypes.BOOL
+_user32.UnhookWinEvent.argtypes = [wintypes.HANDLE]
+_user32.RegisterClassW.restype = wintypes.ATOM
+_user32.RegisterClassW.argtypes = [ctypes.POINTER(_WNDCLASSW)]
+_user32.CreateWindowExW.restype = wintypes.HWND
+_user32.CreateWindowExW.argtypes = [
+    wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+    ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+    wintypes.HWND, wintypes.HMENU, wintypes.HINSTANCE, wintypes.LPVOID]
+_user32.DefWindowProcW.restype = _LRESULT
+_user32.DefWindowProcW.argtypes = [
+    wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+_user32.DestroyWindow.restype = wintypes.BOOL
+_user32.DestroyWindow.argtypes = [wintypes.HWND]
+_user32.UnregisterClassW.restype = wintypes.BOOL
+_user32.UnregisterClassW.argtypes = [wintypes.LPCWSTR, wintypes.HINSTANCE]
+_user32.GetMessageW.restype = wintypes.BOOL
+_user32.GetMessageW.argtypes = [
+    wintypes.LPMSG, wintypes.HWND, wintypes.UINT, wintypes.UINT]
+_user32.DispatchMessageW.restype = _LRESULT
+_user32.DispatchMessageW.argtypes = [wintypes.LPMSG]
+_user32.PostThreadMessageW.restype = wintypes.BOOL
+_user32.PostThreadMessageW.argtypes = [
+    wintypes.DWORD, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+_kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+_kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+_kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+
+
+class _EventHooks:
+    """Daemon thread hosting the foreground WinEvent hook and the
+    display-topology watcher window.  See the section banner above."""
+
+    def __init__(self, manager: "WindowManager") -> None:
+        self._manager = manager
+        self._tid: int = 0
+        self._hook = None
+        self._hwnd: int = 0
+        self._atom: int = 0
+        self._ready = threading.Event()
+        self._last_topology: float = 0.0
+        # ctypes trampolines MUST outlive every callback invocation — hold a
+        # reference here (this object lives on the manager for the whole run).
+        self._winevent_cb = _WINEVENTPROCTYPE(self._on_winevent)
+        self._wndproc_cb = _WNDPROCTYPE(self._on_wndmsg)
+        self._thread = threading.Thread(
+            target=self._run, daemon=True, name="winevent-hook")
+
+    # -- lifecycle -----------------------------------------------------------
+
+    def start(self) -> None:
+        self._thread.start()
+        self._ready.wait(timeout=5.0)
+
+    def stop(self) -> None:
+        """Ask the hook thread to unhook and exit its message loop.  Safe to
+        call from any thread and more than once; never blocks meaningfully."""
+        tid = self._tid
+        if tid:
+            try:
+                _user32.PostThreadMessageW(tid, _WM_QUIT, 0, 0)
+            except Exception:
+                pass
+
+    # -- callbacks (run on the hook thread) --------------------------------
+
+    def _on_winevent(self, hook, event, hwnd, id_object, id_child,
+                     thread_id, time_ms) -> None:
+        try:
+            if id_object != _OBJID_WINDOW:
+                return
+            self._manager._record_fg_event(int(hwnd) if hwnd else 0)
+        except Exception:
+            log.exception("WinEvent callback failed")
+
+    def _on_wndmsg(self, hwnd, msg, wparam, lparam) -> int:
+        try:
+            if msg in (_WM_DISPLAYCHANGE, _WM_SETTINGCHANGE):
+                self._on_topology_change()
+                return 0
+        except Exception:
+            log.exception("Topology WndProc handler failed")
+        return _user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+    def _on_topology_change(self) -> None:
+        # WM_SETTINGCHANGE in particular can arrive in bursts — debounce so a
+        # storm of unrelated system-parameter changes can't thrash the layout.
+        now = time.monotonic()
+        if now - self._last_topology < _TOPOLOGY_DEBOUNCE_S:
+            return
+        self._last_topology = now
+        _flush_monitor_caches()
+        mgr = self._manager
+        try:
+            with mgr._lock:
+                mgr._focused.clear()
+        except Exception:
+            log.exception("Topology change: could not reset focus state")
+        log.info("Display topology changed — caches flushed, retiling fresh.")
+
+    # -- thread body -----------------------------------------------------
+
+    def _run(self) -> None:
+        self._tid = _kernel32.GetCurrentThreadId()
+        try:
+            self._install()
+        except Exception:
+            log.exception("WinEvent hook thread failed to initialise — "
+                          "foreground detection falls back to poll cadence")
+            self._ready.set()
+            return
+        self._ready.set()
+        try:
+            self._pump()
+        except Exception:
+            log.exception("WinEvent hook message loop crashed")
+        finally:
+            self._teardown()
+
+    def _install(self) -> None:
+        hinst = _kernel32.GetModuleHandleW(None)
+
+        wc = _WNDCLASSW()
+        wc.lpfnWndProc = self._wndproc_cb
+        wc.hInstance = hinst
+        wc.lpszClassName = _WNDCLASS_NAME
+        self._atom = _user32.RegisterClassW(ctypes.byref(wc))
+        # atom == 0 with "class already exists" is harmless on a restart.
+
+        self._hwnd = _user32.CreateWindowExW(
+            0, _WNDCLASS_NAME, "WFM topology watcher", 0,
+            0, 0, 0, 0, 0, 0, hinst, None) or 0
+        if not self._hwnd:
+            log.warning("Topology watcher window could not be created — "
+                        "display-change handling disabled.")
+
+        self._hook = _user32.SetWinEventHook(
+            _EVENT_SYSTEM_FOREGROUND, _EVENT_SYSTEM_FOREGROUND, 0,
+            self._winevent_cb, 0, 0,
+            _WINEVENT_OUTOFCONTEXT | _WINEVENT_SKIPOWNPROCESS)
+        if not self._hook:
+            log.warning("SetWinEventHook returned NULL — foreground events "
+                        "unavailable, falling back to poll cadence.")
+        else:
+            log.info("Foreground WinEvent hook installed.")
+
+    def _pump(self) -> None:
+        msg = wintypes.MSG()
+        pmsg = ctypes.byref(msg)
+        while True:
+            r = _user32.GetMessageW(pmsg, 0, 0, 0)
+            if r == 0 or r == -1:   # 0 = WM_QUIT, -1 = error
+                break
+            _user32.DispatchMessageW(pmsg)
+
+    def _teardown(self) -> None:
+        if self._hook:
+            try:
+                _user32.UnhookWinEvent(self._hook)
+            except Exception:
+                pass
+            self._hook = None
+        if self._hwnd:
+            try:
+                _user32.DestroyWindow(self._hwnd)
+            except Exception:
+                pass
+            self._hwnd = 0
+        if self._atom:
+            try:
+                _user32.UnregisterClassW(
+                    _WNDCLASS_NAME, _kernel32.GetModuleHandleW(None))
+            except Exception:
+                pass
+            self._atom = 0
+        log.debug("WinEvent hook thread stopped.")
+
+
+def start_event_hooks(manager: "WindowManager") -> _EventHooks:
+    """Create, register on the manager, and start the event-hook thread.
+
+    Returns the _EventHooks controller (already started).  Raising is left to
+    the caller to handle — a failure here should not be fatal to the app.
+    """
+    hooks = _EventHooks(manager)
+    manager._event_hooks = hooks
+    hooks.start()
+    return hooks
 
 

@@ -10,8 +10,11 @@ A lightweight tiling window manager for Windows that automatically expands your 
 
 - **Click-to-tile** — focus a window and every window on that monitor snaps into contiguous, gap-free tiles; the focused window gets the largest share.
 - **Hover mode** *(optional)* — windows tile as your cursor rests on them.
+- **Layout presets** — columns, quadrants, triptych or a fixed grid, or let it pick automatically by window count. Windows keep their position; only the shared edges move.
 - **Smooth animations** — gap-free transitions with no visible desktop flash mid-animation.
-- **Per-monitor** — each monitor tiles independently; landscape splits left/right, portrait splits top/bottom.
+- **Focus outline** *(optional)* — a subtle highlight around the focused window while the app resizes it; colour, opacity and thickness are configurable.
+- **Per-monitor** — each monitor tiles independently; landscape splits left/right, portrait splits top/bottom. Layout and expand ratio can be overridden per display.
+- **Runs quietly** — reacts to focus changes instantly, recovers on its own if something goes wrong, and refuses to start a second copy.
 - **App exclusions** — skip specific windows by title or executable (e.g. Spotify, picture-in-picture).
 - **Native settings window** — configure everything from a real desktop window (no browser, no background server).
 - **System tray** — Pause/Resume, Open Settings, Exit.
@@ -43,9 +46,11 @@ Once running, it works automatically:
 Open Settings from the tray icon to configure:
 
 - **Expand ratio** — how much of the screen the focused window gets.
+- **Layouts** — pick a preset (columns, quadrants, triptych, grid) or let it choose by window count, with tuning for gap, focus dominance and switch delay.
 - **Hover mode** and hover delay.
 - **Animation** on/off and duration.
-- **Monitors** — choose which displays to manage.
+- **Focus outline** on/off, colour, opacity and thickness.
+- **Monitors** — choose which displays to manage, and override the layout or expand ratio per display.
 - **App exclusions** — skip windows by title or executable.
 - **Start with Windows.**
 
