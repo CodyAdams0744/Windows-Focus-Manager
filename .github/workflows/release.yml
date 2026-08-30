@@ -1,0 +1,45 @@
+name: Release
+
+# Push a version tag (e.g. v1.3.1) and this builds the installer and opens a
+# DRAFT GitHub release with it attached. Review the notes, then publish.
+# Do not create the release by hand first — let this job own it.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      PYTHONUTF8: "1"   # build.py prints box-drawing characters
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      - name: Build exe + installer + zip
+        run: python build.py
+
+      - name: Draft release with the installer attached
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            installer_output/WindowFocusManager_Setup.exe
+            release/WindowFocusManager_Setup.zip

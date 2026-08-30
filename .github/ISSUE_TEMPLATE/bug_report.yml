@@ -1,0 +1,58 @@
+name: Bug report
+description: Something isn't tiling the way it should
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The `wfm.log` is almost always what's needed to diagnose a tiling problem — please include it.
+        It's at `%LOCALAPPDATA%\WindowFocusManager\wfm.log`. For the most detail, set
+        **Settings → System → Log level** to `DEBUG`, reproduce the issue, then grab the log.
+
+  - type: input
+    id: version
+    attributes:
+      label: App version
+      description: From "Add or remove programs", or the installer filename.
+      placeholder: "1.3.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: windows
+    attributes:
+      label: Windows version
+      options:
+        - Windows 11
+        - Windows 10
+        - Other / not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: monitors
+    attributes:
+      label: Monitor setup
+      description: Count, resolution, orientation (landscape/portrait), and display scaling for each.
+      placeholder: |
+        1× 3440×1392 landscape @ 100% (primary)
+        1× 2160×3840 portrait @ 150%
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: log
+    attributes:
+      label: wfm.log
+      description: Paste the contents (or drag the file in). Trim to the relevant run if it's huge.
+      render: text
+    validations:
+      required: true

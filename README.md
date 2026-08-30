@@ -41,6 +41,8 @@ Once running, it works automatically:
 - **Click** any window to focus it — the windows on that monitor retile, with the focused one getting the most space.
 - **Right-click the system tray icon** to Pause/Resume, open Settings, or exit.
 
+Logs are written to `%LOCALAPPDATA%\WindowFocusManager\wfm.log` — attach it to any bug report (set **Settings → System → Log level** to `DEBUG` first for detail).
+
 ### Settings
 
 Open Settings from the tray icon to configure:
@@ -64,13 +66,15 @@ Changes apply immediately on save — no restart needed.
 
 > This section is **only for developers** who want to build the app themselves. If you just want to use it, download the installer from [Releases](https://github.com/CodyAdams0744/Windows-Focus-Manager/releases) — no Python needed.
 
-**To build, you'll need:** Python 3.8+, and [Inno Setup 6](https://jrsoftware.org/isdl.php) (for the installer stage).
+**To build, you'll need:** Python 3.10 or newer, and [Inno Setup 6](https://jrsoftware.org/isdl.php) (for the installer stage).
 
 ```bash
-pip install -r requirements.txt
-python Scripts/pywin32_postinstall.py -install   # one-time pywin32 setup
+pip install -r requirements-dev.txt
 python build.py
 ```
+
+(Modern `pywin32` wheels need no post-install step. If you hit a `pywintypes` DLL
+error, run `python -m pywin32_postinstall -install` once.)
 
 `build.py` runs four stages — icon → PyInstaller exe → Inno Setup wizard → zip — and produces:
 
@@ -81,6 +85,7 @@ python build.py
 To run from source without building:
 
 ```bash
+pip install -r requirements.txt
 python main.py
 ```
 

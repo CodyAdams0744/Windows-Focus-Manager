@@ -1,0 +1,7 @@
+# Tools for building the standalone exe + installer (see build.py).
+# Not needed to run the app from source — that only needs requirements.txt.
+
+-r requirements.txt
+
+pyinstaller>=6.0
+Pillow>=10.0

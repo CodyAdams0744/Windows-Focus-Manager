@@ -13,8 +13,7 @@ Usage
 
 Requirements
 ------------
-  pip install -r requirements.txt   (pywin32, pystray, Pillow, PySide6)
-  pip install pyinstaller
+  pip install -r requirements-dev.txt   (runtime deps + PyInstaller + Pillow)
   Inno Setup 6  https://jrsoftware.org/isdl.php  (for the installer stage)
 """
 
@@ -141,11 +140,6 @@ def _build_exe(icon_path: Path | None) -> Path:
         "--hidden-import", "win32com",
         "--hidden-import", "win32com.client",
         "--hidden-import", "win32process",
-
-        # pystray Windows backend + Pillow
-        "--hidden-import", "pystray._win32",
-        "--collect-all", "pystray",
-        "--collect-all", "PIL",
 
         # PySide6 — the Qt settings window. The PyInstaller hook pulls in the
         # required Qt plugins; we only need the three submodules we import.
